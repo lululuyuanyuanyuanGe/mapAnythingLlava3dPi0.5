@@ -15,7 +15,7 @@ from torch.utils.data import Dataset, Sampler
 
 logger = logging.get_logger(__name__)
 
-from ..LLaVA_3D.llava.constants import IGNORE_INDEX as LLAVA3D_IGNORE_INDEX
+from LLaVA_3D.llava.constants import IGNORE_INDEX as LLAVA3D_IGNORE_INDEX
 
 
 # data patch

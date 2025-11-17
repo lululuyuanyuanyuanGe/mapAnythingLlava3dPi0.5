@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import os
-import sys
-import importlib
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -33,7 +31,6 @@ from transformers.utils import (
 )
 from .configuration_spatialvla import SpatialVLAConfig
 from .modeling_gemma2 import Gemma2ForCausalLM
-from .modeling_llava3d import LLaVA3DForCausalLM
 from transformers import AutoModel, ZoeDepthForDepthEstimation
 
 SIGLIP_MEAN, SIGLIP_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
@@ -169,17 +166,11 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         self.vision_tower = vision_model or AutoModel.from_config(config=config.vision_config)
         self.multi_modal_projector = projector_model or SpatialVLAMultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
-        # Instantiate or use provided language model
-        if language_model is not None:
-            self.language_model = language_model
-        else:
-            if getattr(config, "use_llava3d", False):
-                self.language_model = LLaVA3DForCausalLM(config.text_config)
-            else:
-                self.language_model = Gemma2ForCausalLM(config.text_config)
-        # Sync tied weights keys if the underlying model defines them
-        if getattr(self.language_model, "_tied_weights_keys", None) is not None:
-            self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
+        if language_model is None:
+            language_model = Gemma2ForCausalLM(config=config.text_config)
+        if language_model._tied_weights_keys is not None:
+            self._tied_weights_keys = [f"language_model.{k}" for k in language_model._tied_weights_keys]
+        self.language_model = language_model
 
         if config.use_vision_zoe:
             self.vision_zoe_model = vision_zoe_model or ZoeDepthForDepthEstimation(config.vision_zoe_config)
@@ -373,22 +364,12 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             spatial_selected = (input_ids >= self.config.action_token_begin_idx) & (input_ids < self.config.action_token_begin_idx + self.config.spatial_token_num)
             inputs_embeds[spatial_selected] = inputs_embeds[spatial_selected] * 0.0 + self.spatial_embed_tokens(input_ids[spatial_selected] - self.config.action_token_begin_idx)
 
-        # if cache_position is None:
-        #     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        #     cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
 
-        if getattr(self.config, "use_llava3d", False):
-            # LLaVA-3D uses 0-indexed position_ids
-            if position_ids is None:
-                # Get device and sequence length correctly
-                device = inputs_embeds.device
-                seq_length = inputs_embeds.shape[1]
-                batch_size = inputs_embeds.shape[0]
-                position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
-                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-        else:
-            if position_ids is None:
-                position_ids = cache_position.unsqueeze(0) + 1  # Paligemma positions are 1-indexed
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0) + 1  # Paligemma positions are 1-indexed
 
         # merge
         if pixel_values is not None:
@@ -406,54 +387,28 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
         # mask out pad-token-ids in labels for BC
-        if labels is not None:
-            # Use configured ignore_index to avoid undeclared global constants
-            labels = labels.masked_fill(input_ids == self.pad_token_id, self.config.ignore_index)
+        if labels is not None and self.pad_token_id in labels:
+            logger.warning_once(
+                "`labels` contains `pad_token_id` which will be masked with `config.ignore_index`. ",
+                "You have to mask out `pad_token_id` when preparing `labels`, this behavior will be removed in v.4.46.",
+            )
+            labels = torch.where(input_ids == self.pad_token_id, self.config.ignore_index, labels)
 
-        # 在modeling_spatialvla.py中修改调用language_model的部分
-        if isinstance(self.language_model, LLaVA3DForCausalLM):
-            # 对于LLaVA3D模型，使用布尔类型的attention_mask
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-            else:
-                attention_mask = attention_mask.bool()
-            
-            outputs = self.language_model(
-                attention_mask=attention_mask,  # 使用布尔类型的attention_mask
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                # 移除LLaVA3D不支持的参数
-                # cache_position=cache_position,
-                # num_logits_to_keep=num_logits_to_keep,
-            )
-        else:
-            # 对于其他模型，继续使用原来的causal_mask
-            causal_mask = self._update_causal_mask(
-                attention_mask, token_type_ids, past_key_values, cache_position, input_ids, inputs_embeds, is_training
-            )
-            # 1105 zzq language_model必须传入input_embeds或者inputs_ids,
-            # 如果没有传入inputs_embeds，则必须传入input_ids,这个input_ids和输入的#input_ids不同的是，
-            # 输入的input_ids是原始的input_ids，而这个input_ids是prepare_inputs_labels_for_multimodal生成的input_ids，包含多模态信息
-           
-           
-            # 这里应该传入input_embeds
-            outputs = self.language_model(
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-                num_logits_to_keep=num_logits_to_keep,
-            )
+        causal_mask = self._update_causal_mask(
+            attention_mask, token_type_ids, past_key_values, cache_position, input_ids, inputs_embeds, is_training
+        )
+        outputs = self.language_model(
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            num_logits_to_keep=num_logits_to_keep,
+        )
 
         logits = outputs.logits
         loss = None
@@ -515,45 +470,12 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             token_type_ids=token_type_ids,
             **kwargs,
         )
-        # Only shift position_ids for non-LLaVA-3D (Gemma2 path uses 1-indexed positions)
-        if model_inputs.get("position_ids") is not None and not getattr(self.config, "use_llava3d", False):
+        if model_inputs.get("position_ids") is not None:
             model_inputs["position_ids"] += 1
         if cache_position[0] == 0:
             model_inputs["pixel_values"] = pixel_values
         is_training = token_type_ids is not None and labels is not None
         if cache_position[0] == 0 and isinstance(past_key_values, HybridCache):
-            if getattr(self.config, "use_llava3d", False):
-                # LLaVA-3D不使用_update_causal_mask方法，直接使用attention_mask
-                model_inputs["attention_mask"] = attention_mask
-            
-            # 导入LLaVA-3D的特殊标记常量
-            from model.modeling_llava3d import LLAVA3D_IMAGE_TOKEN_INDEX, LLAVA3D_IGNORE_INDEX
-            from ..LLaVA_3D.llava.constants import LOC_TOKEN_INDEX as LLAVA3D_LOC_TOKEN_INDEX
-            
-            # 如果使用LLaVA-3D，需要转换图像token索引
-            # SpatialVLA: IMAGE_TOKEN_INDEX = 256000
-            # LLaVA-3D: IMAGE_TOKEN_INDEX = -200
-            if input_ids is not None and self.config.image_token_index != LLAVA3D_IMAGE_TOKEN_INDEX:
-                # 创建临时副本以避免修改原始input_ids
-                input_ids_for_llava3d = input_ids.clone()
-                
-                # 将SpatialVLA的图像token索引转换为LLaVA-3D的图像token索引
-                # SpatialVLA: 256000, LLaVA-3D: -200 (IMAGE_TOKEN_INDEX)
-                input_ids_for_llava3d[input_ids == self.config.image_token_index] = LLAVA3D_IMAGE_TOKEN_INDEX
-                
-                # 处理IGNORE_INDEX (LLaVA-3D中为-100)
-                # 如果SpatialVLA中有不同的ignore_index值，也需要转换
-                if hasattr(self.config, "ignore_index") and self.config.ignore_index != LLAVA3D_IGNORE_INDEX:
-                    input_ids_for_llava3d[input_ids == self.config.ignore_index] = LLAVA3D_IGNORE_INDEX
-                
-                # 处理LOC_TOKEN_INDEX (LLaVA-3D中为-300)
-                # 如果SpatialVLA中有类似的位置token，也需要转换
-                if hasattr(self.config, "loc_token_index"):
-                    input_ids_for_llava3d[input_ids == self.config.loc_token_index] = LLAVA3D_LOC_TOKEN_INDEX
-                
-                # 更新model_inputs中的input_ids
-                model_inputs["input_ids"] = input_ids_for_llava3d
-        else:
             causal_mask = self._update_causal_mask(attention_mask, token_type_ids, past_key_values, cache_position, input_ids, inputs_embeds, is_training)
             model_inputs["attention_mask"] = causal_mask
         model_inputs["intrinsic"] = intrinsic

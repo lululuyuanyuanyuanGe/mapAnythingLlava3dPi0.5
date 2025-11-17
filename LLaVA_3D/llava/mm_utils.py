@@ -14,7 +14,7 @@ Boxes = List[Box]
 BoxesSeq = List[Boxes]
 
 from transformers import StoppingCriteria
-from llava.constants import IMAGE_TOKEN_INDEX, LOC_TOKEN_INDEX
+from .constants import IMAGE_TOKEN_INDEX, LOC_TOKEN_INDEX
 
 
 def select_best_resolution(original_size, possible_resolutions):

@@ -23,20 +23,57 @@ from transformers.tokenization_utils_base import AddedToken, PreTokenizedInput, 
 from transformers.utils import logging
 from transformers.models.paligemma.processing_paligemma import (
     make_batched_images, 
-    build_string_from_input, 
     _is_str_or_image, 
-    PaliGemmaProcessorKwargs,
-    IMAGE_TOKEN,
-    EXTRA_TOKENS
+    PaliGemmaProcessorKwargs
 )
+# 使用LLaVA-3D的特殊标记替代PaliGemma的标记
+from LLaVA_3D.llava.constants import (
+    DEFAULT_IMAGE_TOKEN as IMAGE_TOKEN, # 正确
+    DEFAULT_IMAGE_PATCH_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IM_END_TOKEN,
+    IMAGE_PLACEHOLDER,
+    IMAGE_TOKEN_INDEX,
+    IGNORE_INDEX
+)
+# 定义额外的标记
+EXTRA_TOKENS = [DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_PLACEHOLDER]
 from .action_tokenizer import SpatialActionTokenizer
 logger = logging.get_logger(__name__)
+
+
+def build_string_from_input(prompt, bos_token, image_seq_len, image_token, num_images):
+    """
+    Builds a string from the input prompt and image tokens.
+    For example, for the call:
+    build_string_from_input(
+        prompt="Prefix str"
+        bos_token="<s>",
+        image_seq_len=3,
+        image_token="<im>",
+    )
+    The output will be:
+    "<im><im><im><s>Initial str"
+    Args:
+        prompt (`list[Union[str, ImageInput]]`): The input prompt.
+        bos_token (`str`): The beginning of sentence token.
+        image_seq_len (`int`): The length of the image sequence.
+        image_token (`str`): The image token.
+        num_images (`int`): Number of images in the prompt.
+    """
+    return f"{image_token * image_seq_len * num_images}{bos_token}{prompt}\n"
+
+import json
+from pathlib import Path
+
+TOKENIZER_CLASS = ("GemmaTokenizer", "GemmaTokenizerFast")
+
 
 class SpatialVLAProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
     image_processor_class = "SiglipImageProcessor"
-    tokenizer_class = ("GemmaTokenizer", "GemmaTokenizerFast")
+    tokenizer_class = TOKENIZER_CLASS
 
     def __init__(
         self,
@@ -51,8 +88,13 @@ class SpatialVLAProcessor(ProcessorMixin):
         obs_delta=1,
         action_chunk_size=1,
         min_sigma=0.0,
+        use_llava3d=False,  # 添加LLaVA-3D标志
         **kwargs,
     ):
+        self.use_llava3d = use_llava3d
+        # Select tokenizer class deterministically by flag
+        self.tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast") if use_llava3d else ("GemmaTokenizer", "GemmaTokenizerFast")
+
         if image_processor is None:
             raise ValueError("You need to specify an `image_processor`.")
         if tokenizer is None:
@@ -69,12 +111,40 @@ class SpatialVLAProcessor(ProcessorMixin):
             self.image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         else:
             self.image_token_id = tokenizer.image_token_id
+            
+        # 使用LLaVA-3D特殊标记，且在返回中携带索引以便模型转换
+        self.image_token_index = IMAGE_TOKEN_INDEX
+        self.ignore_index = IGNORE_INDEX
+        
+        # 根据模型类型设置不同的聊天模板
+        if use_llava3d:
+            # LLaVA-3D的聊天模板
+            llava_chat_template = """
+            {% if messages[0]['role'] == 'system' %}
+            {{ messages[0]['content'] }}
+            {% endif %}
+            {% for message in messages %}
+            {% if message['role'] == 'user' %}
+            USER: {{ message['content'] }}
+            {% elif message['role'] == 'assistant' %}
+            ASSISTANT: {{ message['content'] }}
+            {% endif %}
+            {% endfor %}
+            """
+            tokenizer.chat_template = llava_chat_template
+        else:
+            # 保持Gemma2默认的聊天模板
+            pass
 
         tokenizer.add_tokens(EXTRA_TOKENS)
         tokenizer.add_bos_token = False
         tokenizer.add_eos_token = False
 
-        super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        # 如果提供了chat_template参数，优先使用提供的模板
+        if chat_template is not None:
+            tokenizer.chat_template = chat_template
+            
+        super().__init__(image_processor, tokenizer, chat_template=tokenizer.chat_template)
 
         # action tokenizer
         self.statistics = statistics if statistics else {}
@@ -149,6 +219,8 @@ class SpatialVLAProcessor(ProcessorMixin):
                     raise ValueError("images must be an image, list of images or list of list of images")
                 if suffix is not None and _is_str_or_image(suffix): suffix = [suffix]
                 if suffix is not None: suffix = [sfx + self.tokenizer.eos_token for sfx in suffix]
+                # The output from build_string_from_input will be:
+                # "<im><im><im><s>Initial str"
                 input_strings = [
                     build_string_from_input(
                         prompt=prompt,
@@ -184,7 +256,14 @@ class SpatialVLAProcessor(ProcessorMixin):
         )
 
         intrinsic = self.dataset_intrinsics[unnorm_key] if unnorm_key in self.dataset_intrinsics else self.dataset_intrinsics["default"]
-        return_data = {**inputs, "pixel_values": pixel_values, "intrinsic": intrinsic}
+        # Attach both tokenizer real id and LLaVA sentinel index for downstream mapping
+        return_data = {
+            **inputs,
+            "pixel_values": pixel_values,
+            "intrinsic": intrinsic,
+            "image_token_id": self.image_token_id,
+            "image_token_index": self.image_token_index,
+        }
 
         if return_token_type_ids:
             labels = inputs["input_ids"].masked_fill(inputs["token_type_ids"] == 0, -100)

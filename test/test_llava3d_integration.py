@@ -20,8 +20,8 @@ from transformers import AutoProcessor
 from transformers.cache_utils import HybridCache
 
 # 导入SpatialVLA相关模块
-from model.modeling_spatialvla import SpatialVLAForConditionalGeneration as SpatialVLAForCausalLM
-from model.configuration_spatialvla import SpatialVLAConfig
+from model.modeling_spatialvla_dev import SpatialVLAForConditionalGeneration as SpatialVLAForCausalLM
+from model.configuration_spatialvla_dev import SpatialVLAConfig
 from model.modeling_llava3d import LLaVA3DForCausalLM
 
 # 从LLaVA-3D导入常量
@@ -40,8 +40,8 @@ class TestLLaVA3DIntegration(unittest.TestCase):
         """设置测试环境"""
         # 解析命令行参数
         parser = argparse.ArgumentParser("SpatialVLA与LLaVA-3D集成测试")
-        parser.add_argument("--model_path", type=str, default="", help="SpatialVLA模型路径")
-        parser.add_argument("--llava3d_path", type=str, default="", help="LLaVA-3D模型路径")
+        parser.add_argument("--model_path", type=str, default="/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/SpatialVLA_llava3d/model_zoo/llava3d_7B", help="SpatialVLA模型路径")
+        parser.add_argument("--llava3d_path", type=str, default="/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/SpatialVLA_llava3d/model_zoo/spatialvla-4b-224", help="LLaVA-3D模型路径")
         parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="运行设备")
         
         # 如果直接运行测试文件，使用默认参数
@@ -52,7 +52,17 @@ class TestLLaVA3DIntegration(unittest.TestCase):
         cls.config = SpatialVLAConfig(
             use_llava3d=True,
             image_token_index=256000,
-            ignore_index=-100
+            ignore_index=-100,
+            text_config={
+                "model_type": "llava_llama",
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "intermediate_size": 11008,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 32,
+                "vocab_size": 32000,
+                "_attn_implementation_internal": "eager"
+            }
         )
         
         # 创建小型测试模型
@@ -258,6 +268,8 @@ class TestLLaVA3DIntegration(unittest.TestCase):
     def test_pixel_values_injection_first_step(self):
         """测试pixel_values仅在首步注入"""
         print("测试pixel_values首步注入...")
+        # 确保走非LLaVA-3D分支，以生成4D因果掩码
+        self.model.config.use_llava3d = False
         input_ids = self.test_input_ids.clone()
         attention_mask = self.test_attention_mask.clone()
         pixel_values = torch.randn(input_ids.shape[0], 3, 224, 224)
@@ -425,7 +437,13 @@ class TestLLaVA3DIntegration(unittest.TestCase):
             print("执行端到端集成测试...")
             
             try:
-                # 加载实际模型
+                # 加载实际模型（若缺少预处理配置则跳过该用例）
+                from pathlib import Path
+                model_dir = Path(self.args.model_path)
+                preproc_ok = (model_dir / "preprocessor_config.json").exists() or (model_dir / "processor_config.json").exists()
+                if not preproc_ok:
+                    print("⚠ 跳过端到端测试：模型目录缺少预处理配置文件 preprocessor_config.json/processor_config.json")
+                    return
                 processor = AutoProcessor.from_pretrained(self.args.model_path, trust_remote_code=True)
                 model = SpatialVLAForCausalLM.from_pretrained(
                     self.args.model_path, 

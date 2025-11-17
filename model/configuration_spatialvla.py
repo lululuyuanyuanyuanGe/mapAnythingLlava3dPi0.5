@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ..LLaVA_3D.llava.constants import IGNORE_INDEX as LLAVA3D_IGNORE_INDEX
 import warnings
 
 from transformers.configuration_utils import PretrainedConfig
@@ -28,7 +27,7 @@ class SpatialVLAConfig(PretrainedConfig):
         self,
         vision_config=None,
         text_config=None,
-        ignore_index=None,
+        ignore_index=-100,
         image_token_index=256000,
         vocab_size=257152,
         projection_dim=2048,
@@ -40,20 +39,9 @@ class SpatialVLAConfig(PretrainedConfig):
         ego3d_patch_reso=4,
         n_freqs=8,
         use_vision_zoe=True,
-        use_llava3d=True,  # 新增参数
-        llava3d_model_type="llama",  # 新增参数
         **kwargs,
     ):
-        # 根据 use_llava3d 自动设置 ignore_index
-        if ignore_index is None:
-            if use_llava3d:
-                self._ignore_index = LLAVA3D_IGNORE_INDEX  # LLaVA3D 推荐值
-            else:
-                self._ignore_index = 0     # 普通 SpatialVLA 推荐值
-        else:
-            self._ignore_index = ignore_index
-
-            
+        self._ignore_index = ignore_index
         self.image_token_index = image_token_index
         self._vocab_size = vocab_size
         self.projection_dim = projection_dim
@@ -77,46 +65,21 @@ class SpatialVLAConfig(PretrainedConfig):
                 vocab_size=257152,
                 vision_use_head=False,
             )
-        if use_llava3d:
-            self.use_llava3d = True
-            self.llava3d_model_type = llava3d_model_type
-            # 可以根据LLaVA-3D的需求调整text_config
-            if isinstance(self.text_config, dict):
-                text_config["model_type"] = text_config["model_type"] if "model_type" in text_config else llava3d_model_type
-                self.text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
-            elif text_config is None:
-                # 使用LLaVA-3D默认配置
-                if llava3d_model_type == "llama":
-                    self.text_config = CONFIG_MAPPING["llama"](
-                        hidden_size=4096,
-                        num_hidden_layers=32,
-                        intermediate_size=11008,
-                        num_attention_heads=32,
-                        vocab_size=vocab_size,
-                    )
-                elif llava3d_model_type == "mistral":
-                    self.text_config = CONFIG_MAPPING["mistral"](
-                        hidden_size=4096,
-                        num_hidden_layers=32,
-                        intermediate_size=14336,
-                        num_attention_heads=32,
-                        vocab_size=vocab_size,
-                    )
-        else:
-            self.text_config = text_config
-            if isinstance(self.text_config, dict):
-                text_config["model_type"] = text_config["model_type"] if "model_type" in text_config else "gemma2"
-                self.text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
-            elif text_config is None:
-                self.text_config = CONFIG_MAPPING["gemma2"](
-                    hidden_size=2048,
-                    num_hidden_layers=18,
-                    intermediate_size=16384,
-                    num_attention_heads=8,
-                    num_key_value_heads=1,
-                    is_encoder_decoder=False,
-                    vocab_size=vocab_size,
-                )
+
+        self.text_config = text_config
+        if isinstance(self.text_config, dict):
+            text_config["model_type"] = text_config["model_type"] if "model_type" in text_config else "gemma2"
+            self.text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
+        elif text_config is None:
+            self.text_config = CONFIG_MAPPING["gemma2"](
+                hidden_size=2048,
+                num_hidden_layers=18,
+                intermediate_size=16384,
+                num_attention_heads=8,
+                num_key_value_heads=1,
+                is_encoder_decoder=False,
+                vocab_size=vocab_size,
+            )
         self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
         self.vision_config.projection_dim = projection_dim
 
@@ -127,7 +90,7 @@ class SpatialVLAConfig(PretrainedConfig):
             self.vision_zoe_config = CONFIG_MAPPING[vision_zoe_config["model_type"]](**vision_zoe_config)
         else:
             pass
-        
+
         # additional attributes
         self.action_token_begin_idx = action_token_begin_idx
         self.spatial_token_num = spatial_token_num

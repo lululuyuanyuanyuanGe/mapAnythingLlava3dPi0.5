@@ -10,7 +10,17 @@ torchvision==0.20.1
 tqdm==4.66.6
 transformers==4.47.0
 triton==3.1.0
-flash-attn==2.6.3
+# flash-attn==2.6.3
 datasets==3.0.2
 sentencepiece==0.1.99
 shortuuid
+opencv-python
+scipy==1.14.1
+
+# Training and data pipeline dependencies
+deepspeed==0.15.3
+peft==0.14.0
+tensorflow==2.15.0
+tensorflow-datasets==4.9.3
+tensorflow-io==0.37.1
+tensorflow-graphics==2021.12.3

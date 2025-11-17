@@ -171,4 +171,5 @@ pretrained/*
 outputs
 petrel_client
 huggingface/tmp
-pretrained
+pretrainedmodel_zoo/
+model_zoo/

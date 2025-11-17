@@ -27,16 +27,27 @@ import numpy as np
 import transformers
 import tokenizers
 
-from llava.constants import (IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, 
-                             DEFAULT_IM_END_TOKEN, DEFAULT_VIDEO_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN, 
-                             DEFAULT_VID_START_TOKEN, DEFAULT_VIDEO_PATCH_TOKEN, DEFAULT_VID_END_TOKEN,
-                             DEFAULT_LOC_START_TOKEN, DEFAULT_LOC_END_TOKEN, DEFAULT_BOX_TOKEN)
+from ..constants import (
+    IGNORE_INDEX,
+    IMAGE_TOKEN_INDEX,
+    DEFAULT_IMAGE_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_VIDEO_TOKEN,
+    DEFAULT_IMAGE_PATCH_TOKEN,
+    DEFAULT_VID_START_TOKEN,
+    DEFAULT_VIDEO_PATCH_TOKEN,
+    DEFAULT_VID_END_TOKEN,
+    DEFAULT_LOC_START_TOKEN,
+    DEFAULT_LOC_END_TOKEN,
+    DEFAULT_BOX_TOKEN,
+)
 from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer
+from .llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
-from llava.model import *
-from llava.mm_utils import tokenizer_image_token, map_obj, PlainBoxFormatter, tokenizer_special_token
+from ..model import *
+from ..mm_utils import tokenizer_image_token, map_obj, PlainBoxFormatter, tokenizer_special_token
 
 from PIL import Image
 
