@@ -40,11 +40,13 @@ class SpatialVLAConfig(PretrainedConfig):
         use_spatial_token=False,
         ego3d_patch_reso=4,
         n_freqs=8,
-        use_vision_zoe=False,
+        use_vision_zoe=True,
         use_llava3d=True,  # 新增参数
         llava3d_model_type="llama",  # 新增参数
         **kwargs,
     ):
+        self.use_llava3d = use_llava3d
+        self.llava3d_model_type = llava3d_model_type
         # 根据 use_llava3d 自动设置 ignore_index
         if ignore_index is None:
             if use_llava3d:
@@ -79,8 +81,6 @@ class SpatialVLAConfig(PretrainedConfig):
                 vision_use_head=False,
             )
         if use_llava3d:
-            self.use_llava3d = True
-            self.llava3d_model_type = llava3d_model_type
             # 可以根据LLaVA-3D的需求调整text_config
             if isinstance(text_config, dict):
                 text_config["model_type"] = text_config.get("model_type", llava3d_model_type)

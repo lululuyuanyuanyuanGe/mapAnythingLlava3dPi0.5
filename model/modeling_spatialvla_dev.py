@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import os
-import sys
-import importlib
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -102,6 +100,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         self.multi_modal_projector = projector_model or SpatialVLAMultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
         # Initialize language_model correctly without overwriting with None
+        # zzq 1117 增加在config读取use_llava3d，根据config选择是否使用LLaVA-3D
         if language_model is None:
             if getattr(config, "use_llava3d", False):
                 language_model = LLaVA3DForCausalLM(config.text_config)
@@ -110,7 +109,19 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         if getattr(language_model, "_tied_weights_keys", None) is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in language_model._tied_weights_keys]
         self.language_model = language_model
-        
+        # zzq 1117 暂时不使用vision_zoe
+        # if config.use_vision_zoe:
+        #     self.vision_zoe_model = vision_zoe_model or ZoeDepthForDepthEstimation(config.vision_zoe_config)
+        #     self.position_embedding_3d = Ego3DPositionEmbeddingMLP(
+        #         config.ego3d_patch_reso**2 * 3, num_pos_feats=config.vision_config.hidden_size, n_freqs=config.n_freqs
+        #     )
+        #     # register buffer
+        #     patch_size, reso, image_size = config.vision_config.patch_size, config.ego3d_patch_reso, config.vision_config.image_size
+        #     y, x = torch.meshgrid(torch.arange(0, image_size, patch_size // reso), torch.arange(0, image_size, patch_size // reso), indexing="ij")  # (h//sp w//sp)
+        #     y, x = y + patch_size / reso / 2, x + patch_size / reso / 2
+        #     uv_h = torch.stack([x, y, torch.ones_like(x)], dim=0).reshape(3, -1)  # (3 hw)
+        #     self.register_buffer("uv_h", uv_h, persistent=False)
+
         # shared spatial embeddings for <ACTION> <IMG>
         if config.use_spatial_token:
             self.spatial_embed_tokens = nn.Embedding(self.config.spatial_token_num, config.text_config.hidden_size)
@@ -242,6 +253,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         # Temporarily use only the visual branch, mirroring base implementation
         siglip_pixel_values = TF.normalize(pixel_values, mean=SIGLIP_MEAN, std=SIGLIP_STD)
         image_outputs = self.vision_tower(siglip_pixel_values)
+        # zzq 1117 舍弃use_vision_zoe逻辑
         selected_image_feature = image_outputs.last_hidden_state
         image_features = self.multi_modal_projector(selected_image_feature)
         image_features = image_features / (self.config.text_config.hidden_size ** 0.5)
@@ -254,6 +266,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         actions: Optional[torch.FloatTensor] = None,
         intrinsic: Optional[torch.Tensor] = None,
         image_token_id: Optional[int] = None,
+        image_token_index: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
@@ -273,13 +286,17 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         return_dict = return_dict or self.config.use_return_dict
 
         is_training = token_type_ids is not None and labels is not None
+        if isinstance(image_token_id, torch.Tensor):
+            image_token_id = int(image_token_id.item())
+        spatial_img_id = image_token_id if image_token_id is not None else getattr(self.config, "image_token_index", None)
         
         if inputs_embeds is None:
             # Avoid embedding out-of-range indices (e.g., image or special tokens outside vocab)
             safe_id = self.pad_token_id if self.pad_token_id is not None and self.pad_token_id >= 0 else 0
             ids_for_embed = input_ids.clone()
             # Mask image tokens to a safe id before embedding; will be replaced by image features later
-            ids_for_embed[input_ids == self.config.image_token_index] = safe_id
+            if spatial_img_id is not None:
+                ids_for_embed[input_ids == spatial_img_id] = safe_id
             # If a loc token index exists and is outside vocab, mask it as well
             if hasattr(self.config, "loc_token_index"):
                 ids_for_embed[input_ids == self.config.loc_token_index] = safe_id
@@ -292,9 +309,14 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             spatial_selected = (input_ids >= self.config.action_token_begin_idx) & (input_ids < self.config.action_token_begin_idx + self.config.spatial_token_num)
             inputs_embeds[spatial_selected] = inputs_embeds[spatial_selected] * 0.0 + self.spatial_embed_tokens(input_ids[spatial_selected] - self.config.action_token_begin_idx)
 
-        # if cache_position is None:
-        #     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        #     cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + seq_len,
+                device=inputs_embeds.device if inputs_embeds is not None else input_ids.device,
+            )
 
         if position_ids is None:
             if getattr(self.config, "use_llava3d", False):
@@ -313,8 +335,9 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
 
         # merge
         if pixel_values is not None:
+            if spatial_img_id is None:
+                raise ValueError("`image_token_id` must be provided when supplying `pixel_values`.")
             image_features = self.get_image_features(pixel_values, intrinsic)
-            spatial_img_id = image_token_id if image_token_id is not None else self.config.image_token_index
             special_image_mask = (input_ids == spatial_img_id).unsqueeze(-1)
             special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
             if inputs_embeds[special_image_mask].numel() != image_features.numel():
@@ -331,16 +354,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         if labels is not None:
             # ignore pad positions
             labels = torch.where(input_ids == self.pad_token_id, self.config.ignore_index, labels)
-            # ignore image token positions (prefer dynamic id if provided via kwargs)
-            spatial_img_id = None
-            # try to infer dynamic id from kwargs captured by prepare_inputs_for_generation path
-            # if not present, fallback to config.image_token_index
-            try:
-                spatial_img_id = kwargs.get("image_token_id", None)  # type: ignore[name-defined]
-            except Exception:
-                spatial_img_id = None
-            if spatial_img_id is None:
-                spatial_img_id = getattr(self.config, "image_token_index", None)
+            # ignore image token positions
             if spatial_img_id is not None:
                 labels = torch.where(input_ids == spatial_img_id, self.config.ignore_index, labels)
             # ignore loc token positions if defined
@@ -432,6 +446,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         pixel_values=None,
         intrinsic=None,
         image_token_index: Optional[int] = None,
+        image_token_id: Optional[int] = None,
         attention_mask=None,
         token_type_ids=None,
         use_cache=True,
@@ -467,7 +482,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             # 统一进行图像/特殊标记索引转换（不再依赖 HybridCache 条件）
             if input_ids is not None:
                 # 优先使用传入的 image_token_index；否则使用配置值
-                spatial_img_idx = image_token_index if image_token_index is not None else (kwargs.get("image_token_index", None) or self.config.image_token_index)
+                spatial_img_idx = image_token_index if image_token_index is not None else self.config.image_token_index
                 if spatial_img_idx != LLAVA3D_IMAGE_TOKEN_INDEX:
                     input_ids_for_llava3d = input_ids.clone()
                     input_ids_for_llava3d[input_ids == spatial_img_idx] = LLAVA3D_IMAGE_TOKEN_INDEX
@@ -488,6 +503,12 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         if inputs_embeds is not None:
             model_inputs["inputs_embeds"] = inputs_embeds
         model_inputs["intrinsic"] = intrinsic
+        if image_token_id is not None:
+            if isinstance(image_token_id, torch.Tensor):
+                image_token_id = int(image_token_id.item())
+            model_inputs["image_token_id"] = image_token_id
+        if image_token_index is not None:
+            model_inputs["image_token_index"] = image_token_index
         return model_inputs
 
     @torch.no_grad()
@@ -530,6 +551,23 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             weights_only=weights_only,
             **kwargs,
         )
-        if model.config.use_spatial_token: 
-            model.language_model.model.embed_tokens.weight.data[-model.config.spatial_token_num:] = model.spatial_embed_tokens.weight.data
+        if model.config.use_spatial_token and model.spatial_embed_tokens is not None:
+            language_embeddings = model.language_model.get_input_embeddings()
+            if language_embeddings is not None:
+                lm_weight = language_embeddings.weight
+                spatial_weight = model.spatial_embed_tokens.weight.to(lm_weight.dtype)
+                if (
+                    lm_weight.shape[-1] == spatial_weight.shape[-1]
+                    and lm_weight.shape[0] >= model.config.spatial_token_num
+                ):
+                    lm_weight.data[-model.config.spatial_token_num :] = spatial_weight
+                else:
+                    logger.warning(
+                        "Skip copying spatial embeddings because the language model embedding shape %s "
+                        "is incompatible with spatial token shape %s.",
+                        tuple(lm_weight.shape),
+                        tuple(spatial_weight.shape),
+                    )
+            else:
+                logger.warning("Language model does not expose input embeddings; spatial tokens cannot be copied.")
         return model
