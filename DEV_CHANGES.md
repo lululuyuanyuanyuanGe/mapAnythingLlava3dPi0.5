@@ -141,15 +141,50 @@
 - state_dict 过滤加载：只加载视觉塔/投影器权重，语言侧用 LLaVA‑3D 权重，减少“unused weights”提示。
 - 环境依赖：安装兼容版本的 `protobuf`，移除纯 Python 降级以提升性能。
  - 加载整洁化：在 `from_pretrained` 支持 state_dict 过滤，只加载视觉塔/投影器权重，语言侧权重从 LLaVA‑3D，仅映射必要层，减少“unused weights”提示。
- - 文档与测试：将“运行时覆盖”策略写入 README，用例中统一使用组合处理器，减少 `AutoProcessor` 路径差异。
+- 文档与测试：将“运行时覆盖”策略写入 README，用例中统一使用组合处理器，减少 `AutoProcessor` 路径差异。
 
 ---
 
 ## 结论
 - 当前 dev 集成遵循“SpatialVLA 负责视觉侧、LLaVA‑3D 负责语言侧”的准则；核心路径已打通，关键测试与端到端加载在运行时覆盖策略下稳定。
 - 在不改动模型目录的大前提下，通过别名与手动组合处理器的方式，解决了 tokenizer 类型不匹配与目录 auto_map 带来的加载问题。
-- 若后续启用空间嵌入（`use_spatial_token=true`），建议配合维度对齐或适配器，以保证拷贝语义与语言侧维度一致。
-11. 最新调试异常：语言侧嵌入直接替换导致属性错误与新初始化提示
+ - 若后续启用空间嵌入（`use_spatial_token=true`），建议配合维度对齐或适配器，以保证拷贝语义与语言侧维度一致。
+ 11. 最新调试异常：语言侧嵌入直接替换导致属性错误与新初始化提示
+
+---
+
+## 最新问题追踪与定位（2025-11-17）
+
+- 问题：准备阶段图像占位符替换计数为 0（日志 `[E2E] image_token_index set: -200 count_after: 0`）
+  - 根因：仅替换了 `config.image_token_index`（如 257152），未同时替换 tokenizer 的 `image_token_id`，导致文本中的占位符未被映射为 LLaVA-3D 哨兵索引。
+  - 修复：在准备阶段联合替换两类索引（`image_token_index` 与 `image_token_id`）。位置 `model/modeling_spatialvla_dev.py:506-522`。
+  - 前向阶段稳健性：即使准备阶段替换计数为 0，前向注入使用联合掩码识别三类占位符并完成注入（`image_token_index`、`config.image_token_index`、`image_token_id`）。位置 `model/modeling_spatialvla_dev.py:374-382`。
+
+- 问题：注意力掩码长度不匹配导致 `RuntimeError: The size of tensor a (...) must match (...) at dimension 3`（539 vs 270）
+  - 根因：在 LLaVA-3D forward 路径未传递 `cache_position`，LLaMA 使用默认逻辑推断 `causal_mask` 长度，与包含缓存的 `attn_weights` 的最后维度不一致。
+  - 修复：在 LLaVA-3D forward 调用中传入 `cache_position`。位置 `model/modeling_spatialvla_dev.py:415`。
+
+- 问题：KV 头参数不一致导致缓存更新形状冲突（如 `[32, 269, 128]` vs 缓存 `[1, 4, 269, 256]`）
+  - 根因：使用了 SpatialVLA 的 `text_config`（Gemma2 风格）实例化 LLaMA 语言模型，`num_key_value_heads`、`head_dim` 等参数与 LLaVA-3D 权重不匹配。
+  - 修复：在 `from_pretrained` 中从 `llava3d_pretrained_path` 加载语言侧配置（`AutoConfig`），保证 KV 参数与权重一致。位置 `model/modeling_spatialvla_dev.py:588-597`。
+
+- 问题：图像特征与文本嵌入维度不一致（4096 vs 2304）
+  - 根因：目录视觉投影维度为 2304，而 LLaVA-3D 语言隐藏维度为 4096。
+  - 修复：运行时将投影器输出维度对齐语言隐藏维度，直接重建线性层的输出特征数为 LM hidden。位置 `model/modeling_spatialvla_dev.py:132-134`。同时空间 token 嵌入按语言维度构建。位置 `model/modeling_spatialvla_dev.py:122-124`。
+
+- 问题：标签越界导致 `IndexError: Target ... is out of bounds`
+  - 根因：Gemma2 词表约 257k，LLaVA-3D 词表 32k；将真实词表 ID 作为标签会越界。
+  - 修复：在前向中统一屏蔽 pad/image/loc 位置，并将所有越界标签设为 `ignore_index`。位置 `model/modeling_spatialvla_dev.py:386-400`。
+
+- 模板与处理器的一致性
+  - 处理器在 LLaVA-3D 模式设置 LLAMA-2 风格 `chat_template`，并返回 `image_token_id` 与 `image_token_index`，供模型一致使用。位置 `model/processing_spatialvla_dev.py:145-163`, `model/processing_spatialvla_dev.py:314-320`。
+
+- 状态字典过滤与形状保护
+  - 仅加载视觉塔/投影器相关权重，过滤 `language_model.*`；若投影器权重形状与当前线性层不符，则删除相应键以避免加载错误。位置 `model/modeling_spatialvla_dev.py:626-639`，权重形状检查于 `model/modeling_spatialvla_dev.py:629-634`。
+
+### 验证情况
+- 单元测试：注入路径通过（图像特征形状 `(1, 256, 4096)` 与文本图像 token 数 256 对齐）；非 LLaVA 路径生成 4D 因果掩码，pad_token 与越界标签处理正常。
+- 端到端：此前报错的三类问题（替换计数为 0、掩码维度不匹配、KV 头参数冲突）已在上述修复后对症处理。若日志仍出现“count_after: 0”，属准备阶段的替换统计；前向联合掩码保证功能不受影响。
    - 触发场景：在 `test_huggingface_dev.py` 加载 `spatialvla-4b-224` 后，日志显示大量 `language_model.model.layers.*` 权重未使用或新初始化，同时若尝试访问 `language_model.model.embed_tokens` 会报 `AttributeError`。
    - 根因：
      - 语言模型替换为 LLaVA‑3D 后，其内部结构与 Gemma2 不同；不存在 `.model.embed_tokens` 的嵌套属性。

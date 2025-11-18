@@ -1,45 +1,110 @@
 import argparse
 from pathlib import Path
+import os
 import torch
 from PIL import Image
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoModel, AutoProcessor, AutoImageProcessor, AutoTokenizer
 
-parser = argparse.ArgumentParser("Huggingface AutoModel Tesing")
-parser.add_argument("--model_name_or_path", default="", help="pretrained model name or path.")
-parser.add_argument("--num_images", type=int, default=1, help="num_images for testing.")
-parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="device: cuda or cpu")
-parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16","float16","float32"], help="torch dtype")
+# Force protobuf to use pure-Python implementation to avoid sentencepiece pb2 C++ issues
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
-args = parser.parse_args()
-if __name__ == "__main__":
-    model_name_or_path = Path(args.model_name_or_path)
-    
-    processor = AutoProcessor.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-    print(processor.statistics)
+def main():
+    parser = argparse.ArgumentParser("Huggingface AutoModel Testing (dev)")
+    parser.add_argument("--language_model_path", required=True, help="Language model path (LLaVA-3D)")
+    parser.add_argument("--vision_model_path", required=True, help="Vision model path (SigLIP or LLaVA vision)")
+    parser.add_argument("--spatialvla_model_path", default=None, help="Integrated SpatialVLA checkpoint path (optional)")
+    parser.add_argument("--image_path", default=None, help="Test image path")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
+    parser.add_argument("--num_images", type=int, default=1, help="Number of images for testing")
+    args = parser.parse_args()
 
-    # map dtype and set device
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-    torch_dtype = dtype_map.get(args.dtype, torch.bfloat16)
-    model = AutoModel.from_pretrained(args.model_name_or_path, trust_remote_code=True, torch_dtype=torch_dtype).eval()
-    # Ensure LLaVA-3D decoding path is enabled for replaced language model
-    if hasattr(model, "config"):
-        setattr(model.config, "use_llava3d", True)
-    if args.device == "cuda" and torch.cuda.is_available():
-        model = model.cuda()
-    image = Image.open("test/example.png").convert("RGB")
+    # Build processor and model
+    if args.spatialvla_model_path and os.path.isdir(args.spatialvla_model_path):
+        processor = AutoProcessor.from_pretrained(args.spatialvla_model_path, trust_remote_code=True)
+        model = AutoModel.from_pretrained(args.spatialvla_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).eval()
+    else:
+        # Compose processor from components to reflect patch-world semantics
+        # Robust tokenizer loading with fallbacks to avoid sentencepiece/protobuf issues
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.language_model_path, use_fast=True)
+        except Exception:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(args.language_model_path, use_fast=False)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        image_processor = AutoImageProcessor.from_pretrained(args.vision_model_path)
+        # Inject image_seq_length for patch-world expansion
+        seq_len = (image_processor.size["height"] // getattr(image_processor, "patch_size", 14)) ** 2 if hasattr(image_processor, "size") else 256
+        setattr(image_processor, "image_seq_length", int(seq_len))
+        from model.processing_spatialvla_dev import SpatialVLAProcessor
+        from model.configuration_spatialvla_dev import SpatialVLAConfig
+        from model.modeling_spatialvla_dev import SpatialVLAForConditionalGeneration
+
+        processor = SpatialVLAProcessor(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            statistics={"default": {"action": {"q01": [0,0,0], "q99": [1,1,1], "mask": [1,1,1]}}},
+            bin_policy={
+                "translation": {
+                    "theta_bins": [0.0, 0.785398, 1.570796, 2.356194, 3.141593],
+                    "phi_bins": [-3.141593, -1.570796, 0.0, 1.570796, 3.141593],
+                    "r_bins": [0.0, 0.433013, 0.866025, 1.299038, 1.732051],
+                },
+                "rotation": {
+                    "roll_bins": [-1.0, -0.5, 0.0, 0.5, 1.0],
+                    "pitch_bins": [-1.0, -0.5, 0.0, 0.5, 1.0],
+                    "yaw_bins": [-1.0, -0.5, 0.0, 0.5, 1.0],
+                },
+            },
+            intrinsic_config={"default": {"width": 224, "height": 224, "intrinsic": [[200,0,112],[0,200,112],[0,0,1]]}},
+            action_config={
+                "num_bins": {
+                    "translation": {"theta_bins": 4, "phi_bins": 4, "r_bins": 4},
+                    "rotation": {"roll_bins": 4, "pitch_bins": 4, "yaw_bins": 4},
+                    "gripper": 2,
+                },
+                "use_spherical": False,
+            },
+        )
+
+        config = SpatialVLAConfig(
+            language_model_name_or_path=args.language_model_path,
+            vision_model_name_or_path=args.vision_model_path,
+            image_token_index=256000,
+            ignore_index=-100,
+        )
+        model = SpatialVLAForConditionalGeneration(config).eval()
+    # Move model to device
+    dev = str(args.device)
+    if dev.isdigit():
+        dev = f"cuda:{dev}"
+    model = model.to(dev)
+
+    # Prepare image(s)
+    if args.image_path and os.path.exists(args.image_path):
+        image = Image.open(args.image_path).convert("RGB")
+    else:
+        image = Image.open("test/example.png").convert("RGB")
     images = [image] * args.num_images
-    prompt = "What action should the robot take to pick the cup?"
-    inputs = processor(images=images, text=prompt, unnorm_key="bridge_orig/1.0.0", return_tensors="pt")
-    # Inject first-step cache position to ensure pixel_values are included in generation inputs
-    inputs["cache_position"] = torch.tensor([0], dtype=torch.long)
-    # Move inputs to the correct device
-    if args.device == "cuda" and torch.cuda.is_available():
-        inputs = inputs.to(device=model.device)
-    print(inputs)
-    generation_outputs = model.predict_action(inputs)
-    print(generation_outputs, processor.batch_decode(generation_outputs))
 
-    actions = processor.decode_actions(generation_outputs, unnorm_key="bridge_orig/1.0.0")
-    print(actions)
-    
+    prompt = "What action should the robot take to pick the cup?"
+    # use a known key present in statistics for this simple test
+    inputs = processor(images=images, text=prompt, unnorm_key="default", return_tensors="pt")
+    inputs = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in inputs.items()}
+    print({k: (v.shape if hasattr(v, "shape") else type(v)) for k, v in inputs.items()})
+
+    # Predict actions (dev model exposes predict_action)
+    if hasattr(model, "predict_action"):
+        generation_outputs = model.predict_action(inputs)
+        print("generation_outputs:", generation_outputs)
+        actions = processor.decode_actions(generation_outputs, unnorm_key="bridge_orig/1.0.0")
+        print(actions)
+    else:
+        # Fallback to generate
+        out = model.generate(**inputs, max_new_tokens=16)
+        print("generate outputs:", out)
+
     print("DONE!")
+
+if __name__ == "__main__":
+    main()

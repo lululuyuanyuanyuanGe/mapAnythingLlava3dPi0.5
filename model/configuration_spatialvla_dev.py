@@ -17,6 +17,9 @@ import warnings
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 from transformers import CONFIG_MAPPING, AutoConfig
+from LLaVA_3D.llava.constants import (
+    IGNORE_INDEX as LLAVA3D_IGNORE_INDEX,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -29,6 +32,10 @@ class SpatialVLAConfig(PretrainedConfig):
         self,
         vision_config=None,
         text_config=None,
+        vision_model_name_or_path="google/siglip-so400m-patch14-224",
+        language_model_name_or_path=None,
+        vision_weight_source="siglip_official",
+        spatialvla_vision_pretrained_path=None,
         ignore_index=None,
         image_token_index=256000,
         vocab_size=257152,
@@ -41,35 +48,32 @@ class SpatialVLAConfig(PretrainedConfig):
         ego3d_patch_reso=4,
         n_freqs=8,
         use_vision_zoe=True,
-        use_llava3d=True,  # 新增参数
-        llava3d_model_type="llama",  # 新增参数
+        image_seq_length=None,
         **kwargs,
     ):
-        self.use_llava3d = use_llava3d
-        self.llava3d_model_type = llava3d_model_type
-        # 根据 use_llava3d 自动设置 ignore_index
-        if ignore_index is None:
-            if use_llava3d:
-                self._ignore_index = LLAVA3D_IGNORE_INDEX  # LLaVA3D 推荐值
-            else:
-                self._ignore_index = -100  # 与原版/HF约定一致
-        else:
-            self._ignore_index = ignore_index
+        if language_model_name_or_path is None and text_config is None:
+            raise ValueError("Provide either `language_model_name_or_path` or a complete `text_config` for integrated checkpoints.")
 
-            
+        self.vision_model_name_or_path = vision_model_name_or_path
+        self.language_model_name_or_path = language_model_name_or_path
+        self.vision_weight_source = vision_weight_source
+        self.spatialvla_vision_pretrained_path = spatialvla_vision_pretrained_path
+        # 根据 LLaVA-3D 协议设置 ignore_index（可被覆盖）
+        self._ignore_index = LLAVA3D_IGNORE_INDEX if ignore_index is None else ignore_index
+
         self.image_token_index = image_token_index
-        self._vocab_size = vocab_size
-        self.projection_dim = projection_dim
-        self.hidden_size = hidden_size
-        self.vision_config = vision_config
         self.is_encoder_decoder = False
-
-        if isinstance(self.vision_config, dict):
-            vision_config["model_type"] = (
-                vision_config["model_type"] if "model_type" in vision_config else "siglip_vision_model"
-            )
-            self.vision_config = CONFIG_MAPPING[vision_config["model_type"]](**vision_config)
-        elif vision_config is None:
+        # 构建纯视觉 vision_config（遵循原版 SpatialVLA 语义）
+        if isinstance(vision_config, dict):
+            vc = dict(vision_config)
+            vc["model_type"] = vc.get("model_type", "siglip_vision_model")
+            self.vision_config = CONFIG_MAPPING[vc["model_type"]](**vc)
+        elif isinstance(vision_config, PretrainedConfig):
+            self.vision_config = vision_config
+        elif vision_config is None and vision_model_name_or_path is not None:
+            raw_cfg = AutoConfig.from_pretrained(vision_model_name_or_path, trust_remote_code=True)
+            self.vision_config = getattr(raw_cfg, "vision_config", raw_cfg)
+        else:
             self.vision_config = CONFIG_MAPPING["siglip_vision_model"](
                 intermediate_size=4096,
                 hidden_size=1152,
@@ -80,69 +84,43 @@ class SpatialVLAConfig(PretrainedConfig):
                 vocab_size=257152,
                 vision_use_head=False,
             )
-        if use_llava3d:
-            # 可以根据LLaVA-3D的需求调整text_config
-            if isinstance(text_config, dict):
-                text_config["model_type"] = text_config.get("model_type", llava3d_model_type)
-                self.text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
-            elif text_config is None:
-                # 使用LLaVA-3D默认配置
-                if llava3d_model_type == "llama":
-                    self.text_config = CONFIG_MAPPING["llama"](
-                        hidden_size=4096,
-                        num_hidden_layers=32,
-                        intermediate_size=11008,
-                        num_attention_heads=32,
-                        vocab_size=vocab_size,
-                    )
-                elif llava3d_model_type == "mistral":
-                    self.text_config = CONFIG_MAPPING["mistral"](
-                        hidden_size=4096,
-                        num_hidden_layers=32,
-                        intermediate_size=14336,
-                        num_attention_heads=32,
-                        vocab_size=vocab_size,
-                    )
-            else:
-                # 传入的是一个已构建好的配置对象
-                self.text_config = text_config
+        # 语言侧使用 LLaVA-3D 的配置（支持集成权重场景：直接用提供的 text_config）
+        if isinstance(text_config, dict):
+            mt = text_config.get("model_type")
+            if mt is None:
+                raise ValueError("`text_config` dict must include `model_type` for reconstruction.")
+            self.text_config = CONFIG_MAPPING[mt](**text_config)
+        elif isinstance(text_config, PretrainedConfig):
+            self.text_config = text_config
         else:
-            if isinstance(text_config, dict):
-                text_config["model_type"] = text_config.get("model_type", "gemma2")
-                self.text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
-            elif text_config is None:
-                self.text_config = CONFIG_MAPPING["gemma2"](
-                    hidden_size=2048,
-                    num_hidden_layers=18,
-                    intermediate_size=16384,
-                    num_attention_heads=8,
-                    num_key_value_heads=1,
-                    is_encoder_decoder=False,
-                    vocab_size=vocab_size,
-                )
-            else:
-                self.text_config = text_config
-        self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
-        self.vision_config.projection_dim = projection_dim
+            self.text_config = AutoConfig.from_pretrained(language_model_name_or_path, trust_remote_code=True)
+        # 计算图像补丁数，统一从纯视觉 config 读取；若 image_size 为 (H,W)，取 H
+        image_size = getattr(self.vision_config, "image_size", None)
+        patch_size = getattr(self.vision_config, "patch_size", None)
+        if isinstance(image_size, (list, tuple)):
+            image_size = image_size[0]
+        inferred_tokens = None
+        if image_size is not None and patch_size is not None:
+            inferred_tokens = (image_size // patch_size) ** 2
+        # 优先使用外部传入的 image_seq_length，其次使用视觉配置推断
+        if image_seq_length is not None:
+            self.text_config.num_image_tokens = int(image_seq_length)
+            self.image_seq_length = int(image_seq_length)
+        elif inferred_tokens is not None:
+            self.text_config.num_image_tokens = int(inferred_tokens)
+            self.image_seq_length = int(inferred_tokens)
+        else:
+            # 延迟推断：首次前向通过视觉塔得到序列长度后写回
+            self.text_config.num_image_tokens = getattr(self.text_config, "num_image_tokens", None)
+            self.image_seq_length = getattr(self.text_config, "num_image_tokens", None)
+        # projector 输出维度对齐语言侧 hidden_size
+        self.vision_config.projection_dim = self.text_config.hidden_size
 
         # vision zoe config
         self.vision_zoe_config = vision_zoe_config
         if use_vision_zoe:
-            if isinstance(self.vision_zoe_config, dict):
-                vision_zoe_config["model_type"] = vision_zoe_config.get("model_type", "zoedepth")
-                self.vision_zoe_config = CONFIG_MAPPING[vision_zoe_config["model_type"]](**vision_zoe_config)
-            elif self.vision_zoe_config is None:
-                # Provide a safe default ZoeDepth config when depth is enabled but not provided
-                try:
-                    self.vision_zoe_config = CONFIG_MAPPING["zoedepth"]()
-                except Exception:
-                    # If zoedepth is unavailable, gracefully disable depth usage
-                    self.use_vision_zoe = False
-            else:
-                # Already a config object, keep as is
-                pass
+            pass
         else:
-            # Depth not used; leave as provided (likely None)
             pass
         
         # additional attributes
@@ -152,7 +130,12 @@ class SpatialVLAConfig(PretrainedConfig):
         self.ego3d_patch_reso = ego3d_patch_reso
         self.n_freqs = n_freqs
         self.use_vision_zoe = use_vision_zoe
-
+        self.hidden_size = self.text_config.hidden_size
+        self._vocab_size = self.text_config.vocab_size
+        self.projection_dim = self.vision_config.projection_dim
+        # 统一存储：若上面尚未设置 image_seq_length，则与 text_config.num_image_tokens 对齐
+        if getattr(self, "image_seq_length", None) is None and getattr(self.text_config, "num_image_tokens", None) is not None:
+            self.image_seq_length = int(self.text_config.num_image_tokens)
         super().__init__(**kwargs)
 
     @property

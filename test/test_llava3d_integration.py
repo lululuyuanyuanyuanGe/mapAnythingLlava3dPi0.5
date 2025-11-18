@@ -2,490 +2,309 @@
 # -*- coding: utf-8 -*-
 
 """
-测试SpatialVLA与LLaVA-3D的集成功能
+测试新架构下SpatialVLA与LLaVA-3D的集成功能
 主要测试：
-1. 特殊标记转换逻辑
-2. 注意力掩码处理
-3. 模型推理功能
+1. 灵活的视觉模型加载（官方模型 vs. 从SpatialVLA提取）
+2. 统一的特殊标记转换逻辑
+3. 端到端推理流程
 """
 
 import argparse
+import os
+import sys
 import unittest
+from unittest.mock import patch, MagicMock
+
 import torch
-import numpy as np
-from pathlib import Path
 from PIL import Image
+from transformers import AutoProcessor, AutoConfig, AutoImageProcessor, AutoTokenizer
 
-from transformers import AutoProcessor
-from transformers.cache_utils import HybridCache
+# Force protobuf to use pure-Python implementation to avoid sentencepiece pb2 C++ issues in tests
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
-# 导入SpatialVLA相关模块
-from model.modeling_spatialvla_dev import SpatialVLAForConditionalGeneration as SpatialVLAForCausalLM
+# 导入重构后的SpatialVLA模块
+from model.modeling_spatialvla_dev import SpatialVLAForConditionalGeneration
 from model.configuration_spatialvla_dev import SpatialVLAConfig
-from model.modeling_llava3d import LLaVA3DForCausalLM
 
 # 从LLaVA-3D导入常量
 from LLaVA_3D.llava.constants import (
-    IGNORE_INDEX, 
-    IMAGE_TOKEN_INDEX, 
-    LOC_TOKEN_INDEX
+    IMAGE_TOKEN_INDEX as LLAVA3D_IMAGE_TOKEN_INDEX
 )
 
+# --- Mocking Zone for Fast Unit Tests ---
+class MockLLaVAModel(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = torch.nn.Embedding(self.config.vocab_size, self.config.hidden_size)
+        self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size)
+    def get_input_embeddings(self):
+        return self.embed_tokens
+    def forward(self, inputs_embeds, **kwargs):
+        batch, seq, hidden = inputs_embeds.shape
+        output = MagicMock()
+        output.loss = torch.tensor(0.5, device=inputs_embeds.device)
+        output.logits = torch.randn(batch, seq, self.vocab_size, device=inputs_embeds.device)
+        output.past_key_values = None
+        return output
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return {"input_ids": input_ids, **kwargs}
 
-class TestLLaVA3DIntegration(unittest.TestCase):
-    """测试SpatialVLA与LLaVA-3D的集成功能"""
+class MockVisionTower(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def forward(self, pixel_values, **kwargs):
+        batch_size = pixel_values.shape[0]
+        # config may be the full SpatialVLAConfig; prefer text_config.num_image_tokens
+        vision_cfg = getattr(self.config, "vision_config", self.config)
+        hidden_size = getattr(vision_cfg, "hidden_size", 1152)
+        text_cfg = getattr(self.config, "text_config", None)
+        if text_cfg is not None and hasattr(text_cfg, "num_image_tokens"):
+            num_patches = int(text_cfg.num_image_tokens)
+        else:
+            img_size = getattr(vision_cfg, "image_size", 224)
+            patch_size = getattr(vision_cfg, "patch_size", 16)
+            if isinstance(img_size, (list, tuple)):
+                img_size = img_size[0]
+            num_patches = (img_size // patch_size) ** 2
+        output = MagicMock()
+        output.last_hidden_state = torch.randn(
+            batch_size,
+            num_patches,
+            hidden_size,
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        )
+        return output
+# --- End Mocking Zone ---
+
+
+class TestNewLLaVA3DIntegration(unittest.TestCase):
+    """测试新架构下SpatialVLA与LLaVA-3D的集成功能"""
 
     @classmethod
-    def setUpClass(cls):
-        """设置测试环境"""
-        # 解析命令行参数
-        parser = argparse.ArgumentParser("SpatialVLA与LLaVA-3D集成测试")
-        parser.add_argument("--model_path", type=str, default="/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/SpatialVLA_llava3d/model_zoo/llava3d_7B", help="SpatialVLA模型路径")
-        parser.add_argument("--llava3d_path", type=str, default="/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/SpatialVLA_llava3d/model_zoo/spatialvla-4b-224", help="LLaVA-3D模型路径")
+    @patch('model.modeling_spatialvla_dev.LLaVA3DForCausalLMV2.from_pretrained', side_effect=lambda path, **kwargs: MockLLaVAModel(AutoConfig.from_pretrained(path, **kwargs)))
+    @patch('model.modeling_spatialvla_dev.SpatialVLAForConditionalGeneration._init_vision_tower', autospec=True)
+    def setUpClass(cls, mock_init_vt, mock_llava):
+        """设置测试环境，使用Mock模型进行快速单元测试"""
+        parser = argparse.ArgumentParser("SpatialVLA新架构集成测试")
+        parser.add_argument("--language_model_path", type=str, default="NousResearch/Llama-2-7b-hf", help="语言模型路径 (用于配置)")
+        parser.add_argument("--vision_model_path", type=str, default="google/siglip-base-patch16-224", help="独立的视觉模型路径")
+        parser.add_argument("--spatialvla_model_path", type=str, default=None, help="旧SpatialVLA模型路径 (用于提取视觉权重)")
         parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="运行设备")
+        parser.add_argument("--image_path", type=str, default=None, help="测试图片路径")
         
-        # 如果直接运行测试文件，使用默认参数
-        cls.args = parser.parse_args([])
-        cls.device = torch.device(cls.args.device)
+        cls.args, _ = parser.parse_known_args(os.environ.get("TEST_ARGS", "").split())
         
-        # 创建测试用的配置
-        cls.config = SpatialVLAConfig(
-            use_llava3d=True,
-            image_token_index=256000,
-            ignore_index=-100,
-            text_config={
-                "model_type": "llava_llama",
-                "hidden_size": 4096,
-                "num_hidden_layers": 32,
-                "intermediate_size": 11008,
-                "num_attention_heads": 32,
-                "num_key_value_heads": 32,
-                "vocab_size": 32000,
-                "_attn_implementation_internal": "eager"
-            }
-        )
+        # 确保vision_model_path和spatialvla_model_path是互斥的
+        if cls.args.vision_model_path and cls.args.spatialvla_model_path:
+            raise ValueError("只能提供 --vision_model_path 或 --spatialvla_model_path 中的一个，不能同时提供。")
+
+        dev_str = str(cls.args.device)
+        if dev_str.isdigit():
+            dev_str = f"cuda:{dev_str}"
+        elif dev_str.lower() in ("gpu",) and torch.cuda.is_available():
+            dev_str = "cuda:0"
+        cls.device = torch.device(dev_str)
+
+        # 根据传入参数动态构建配置
+        config_kwargs = {
+            "language_model_name_or_path": cls.args.language_model_path,
+            "image_token_index": 256000,
+            "ignore_index": -100,
+        }
         
-        # 创建小型测试模型
-        cls.model = SpatialVLAForCausalLM(cls.config)
+        if cls.args.spatialvla_model_path:
+            print(f"配置模式：使用 SpatialVLA ({cls.args.spatialvla_model_path}) 的视觉权重。")
+            # 基础模型骨架仍然是官方SigLIP
+            config_kwargs["vision_model_name_or_path"] = "google/siglip-base-patch16-224"
+            config_kwargs["vision_weight_source"] = "spatialvla_vision_only"
+            config_kwargs["spatialvla_vision_pretrained_path"] = cls.args.spatialvla_model_path
+        else:
+            print(f"配置模式：使用独立的视觉模型 ({cls.args.vision_model_path})。")
+            config_kwargs["vision_model_name_or_path"] = cls.args.vision_model_path
+            
+        cls.config = SpatialVLAConfig(**config_kwargs)
+        # 使 _init_vision_tower 返回使用测试配置的 MockVisionTower
+        mock_init_vt.return_value = MockVisionTower(cls.config)
+        # 初始化模型
+        cls.model = SpatialVLAForConditionalGeneration(cls.config)
+        cls.model.to(cls.device)
         cls.model.eval()
         
-        # 无需真实tokenizer，测试聚焦于模型与输入拼装
-        
-        # 准备测试数据
         cls.prepare_test_data()
     
     @classmethod
     def prepare_test_data(cls):
-        """准备测试数据"""
-        # 创建测试用的输入数据
-        cls.test_input_ids = torch.tensor([
-            [1, 2, 3, 256000, 4, 5, 6],  # 包含SpatialVLA的图像token
-            [7, 8, 9, 256000, 10, 11, 12]
-        ], dtype=torch.long)
-        
-        cls.test_attention_mask = torch.ones_like(cls.test_input_ids)
-        
-        # 创建测试用的嵌入（维度与模型hidden_size对齐）
-        batch_size, seq_length = cls.test_input_ids.shape
-        hidden_size = cls.model.config.text_config.hidden_size
-        cls.test_inputs_embeds = torch.randn(batch_size, seq_length, hidden_size)
-        
-        # 创建测试用的token_type_ids
-        cls.test_token_type_ids = torch.zeros_like(cls.test_input_ids)
-        
-    def test_token_conversion(self):
-        """测试特殊标记转换逻辑"""
-        print("测试特殊标记转换逻辑...")
-        
-        # 准备输入
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        
-        # 首步 + HybridCache 以触发LLaVA-3D转换逻辑
-        cache_position = torch.tensor([0], dtype=torch.long)
-        fake_hybrid_cache = HybridCache.__new__(HybridCache)
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=fake_hybrid_cache,
-            use_cache=True
-        )
-        
-        # 验证IMAGE_TOKEN_INDEX已被正确转换
-        # 找到原始input_ids中SpatialVLA图像token的位置
-        original_image_token_positions = (input_ids == self.config.image_token_index).nonzero(as_tuple=True)
-        
-        # 检查转换后的input_ids中这些位置是否已变为LLaVA-3D的IMAGE_TOKEN_INDEX
-        converted_input_ids = model_inputs["input_ids"]
-        for batch_idx, seq_idx in zip(original_image_token_positions[0], original_image_token_positions[1]):
-            converted_token = converted_input_ids[batch_idx, seq_idx].item()
-            self.assertEqual(converted_token, IMAGE_TOKEN_INDEX, 
-                            f"位置({batch_idx},{seq_idx})的token未正确转换: {converted_token} != {IMAGE_TOKEN_INDEX}")
-        
-        print("✓ 图像token转换测试通过")
-        
-        # 如果配置中有ignore_index且不等于-100，测试其转换
-        if hasattr(self.config, "ignore_index") and self.config.ignore_index != -100:
-            # 创建包含ignore_index的测试数据
-            ignore_test_input_ids = input_ids.clone()
-            ignore_test_input_ids[0, 2] = self.config.ignore_index
-            
-            # 调用prepare_inputs_for_generation方法（首步+HybridCache）
-            cache_position = torch.tensor([0], dtype=torch.long)
-            fake_hybrid_cache = HybridCache.__new__(HybridCache)
-            ignore_model_inputs = self.model.prepare_inputs_for_generation(
-                input_ids=ignore_test_input_ids,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=fake_hybrid_cache,
-                use_cache=True
-            )
-            
-            # 验证IGNORE_INDEX已被正确转换
-            converted_ignore_input_ids = ignore_model_inputs["input_ids"]
-            self.assertEqual(converted_ignore_input_ids[0, 2].item(), IGNORE_INDEX,
-                           f"IGNORE_INDEX未正确转换: {converted_ignore_input_ids[0, 2].item()} != {IGNORE_INDEX}")
-            
-            print("✓ IGNORE_INDEX转换测试通过")
-        
-        # 如果配置中有loc_token_index，测试其转换
-        if hasattr(self.config, "loc_token_index"):
-            # 创建包含loc_token_index的测试数据
-            loc_test_input_ids = input_ids.clone()
-            loc_test_input_ids[0, 3] = self.config.loc_token_index
-            
-            # 调用prepare_inputs_for_generation方法（首步+HybridCache）
-            cache_position = torch.tensor([0], dtype=torch.long)
-            fake_hybrid_cache = HybridCache.__new__(HybridCache)
-            loc_model_inputs = self.model.prepare_inputs_for_generation(
-                input_ids=loc_test_input_ids,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=fake_hybrid_cache,
-                use_cache=True
-            )
-            
-            # 验证LOC_TOKEN_INDEX已被正确转换
-            converted_loc_input_ids = loc_model_inputs["input_ids"]
-            self.assertEqual(converted_loc_input_ids[0, 3].item(), LOC_TOKEN_INDEX,
-                           f"LOC_TOKEN_INDEX未正确转换: {converted_loc_input_ids[0, 3].item()} != {LOC_TOKEN_INDEX}")
-            
-            print("✓ LOC_TOKEN_INDEX转换测试通过")
-    def test_pad_token_handling(self):
-        """测试pad_token_id处理"""
-        print("测试pad_token_id处理...")
-        
-        # 准备包含pad_token的输入
-        input_ids = self.test_input_ids.clone()
-        input_ids[0, 1] = self.model.pad_token_id  # 设置一个pad_token
-        labels = input_ids.clone()
-        
-        # 测试use_llava3d=True的情况
-        self.model.config.use_llava3d = True
-        
-        # 前向不应因pad_token而崩溃，且应返回loss
-        outputs = self.model(
-            input_ids=input_ids,
-            labels=labels,
-            return_dict=True
-        )
-        self.assertIsNotNone(outputs.loss, "当存在pad_token时，模型应返回有效的loss（内部应忽略pad位置）")
-        print("✓ pad_token处理测试通过（loss有效）")
-    def test_attention_mask_handling(self):
-        """测试注意力掩码处理"""
-        print("测试注意力掩码处理...")
-        
-        # 准备输入
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        
-        # 测试use_llava3d=True的情况
-        self.model.config.use_llava3d = True
-        
-        cache_position = torch.tensor([0], dtype=torch.long)
-        fake_hybrid_cache = HybridCache.__new__(HybridCache)
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=fake_hybrid_cache,
-            use_cache=True
-        )
-        
-        # 验证attention_mask是否直接使用，而不是调用_update_causal_mask
-        self.assertTrue("attention_mask" in model_inputs, "attention_mask应该在model_inputs中")
-        self.assertTrue(torch.equal(model_inputs["attention_mask"], attention_mask), 
-                       "当use_llava3d=True时，应直接使用原始attention_mask")
-        
-        print("✓ LLaVA-3D模式下注意力掩码处理测试通过")
-        
-        # 测试use_llava3d=False的情况
-        self.model.config.use_llava3d = False
-        
-        # 使用非首步以触发_update_causal_mask
-        cache_position = torch.tensor([1], dtype=torch.long)
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=self.test_token_type_ids,
-            cache_position=cache_position,
-            use_cache=True
-        )
-
-    def test_position_ids_handling(self):
-        """测试position_ids在不同模型下的偏移逻辑"""
-        print("测试position_ids偏移逻辑...")
-
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        batch, seq = input_ids.shape
-        base_pos = torch.arange(0, seq, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-
-        # LLaVA-3D：不偏移
-        self.model.config.use_llava3d = True
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=base_pos.clone(),
-            cache_position=torch.tensor([0]),
-            use_cache=True,
-        )
-        self.assertTrue(torch.equal(model_inputs["position_ids"], base_pos), "LLaVA-3D下不应偏移position_ids")
-
-        # 非LLaVA-3D：+1偏移
-        self.model.config.use_llava3d = False
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=base_pos.clone(),
-            cache_position=torch.tensor([0]),
-            use_cache=True,
-        )
-        self.assertTrue(torch.equal(model_inputs["position_ids"], base_pos + 1), "非LLaVA-3D下应对position_ids做+1偏移")
-        print("✓ position_ids偏移逻辑测试通过")
-
-    def test_pixel_values_injection_first_step(self):
-        """测试pixel_values仅在首步注入"""
-        print("测试pixel_values首步注入...")
-        # 确保走非LLaVA-3D分支，以生成4D因果掩码
-        self.model.config.use_llava3d = False
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        pixel_values = torch.randn(input_ids.shape[0], 3, 224, 224)
-
-        # 首步应注入
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            cache_position=torch.tensor([0]),
-            use_cache=True,
-        )
-        self.assertIn("pixel_values", model_inputs, "首步应将pixel_values注入model_inputs")
-
-        # 非首步不注入
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            cache_position=torch.tensor([1]),
-            use_cache=True,
-        )
-        self.assertNotIn("pixel_values", model_inputs, "非首步不应注入pixel_values")
-        print("✓ pixel_values首步注入测试通过")
-        
-        # 验证是否调用了_update_causal_mask
-        self.assertTrue("attention_mask" in model_inputs, "attention_mask应该在model_inputs中")
-        # 注意：由于_update_causal_mask的具体实现可能很复杂，这里只能验证输出不等于原始attention_mask
-        self.assertFalse(torch.equal(model_inputs["attention_mask"], attention_mask), 
-                        "当use_llava3d=False时，应调用_update_causal_mask生成新的attention_mask")
-        
-        print("✓ SpatialVLA模式下注意力掩码处理测试通过")
-    
-    def test_model_forward(self):
-        """测试模型前向传播"""
-        print("测试模型前向传播...")
-        
-        # 准备输入
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        inputs_embeds = self.test_inputs_embeds.clone()
-        
-        # 测试use_llava3d=True的情况
-        self.model.config.use_llava3d = True
-        
+        """准备测试数据：使用真实 Processor 构造输入，并注入占位符以测试转换"""
+        cls.spatialvla_placeholder_idx = cls.config.image_token_index
+        # 构造processor（需要image_seq_length、tokenizer）
+        vision_path = cls.args.vision_model_path or "google/siglip-base-patch16-224"
         try:
-            # 调用模型前向传播
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                return_dict=True
-            )
-            
-            # 由于我们使用的是测试模型，可能无法实际运行，这里只验证代码不会崩溃
-            print("✓ 模型前向传播测试通过")
-        except Exception as e:
-            # 如果是因为模型结构不完整导致的错误，可以忽略
-            if "NotImplementedError" in str(e) or "requires_grad" in str(e):
-                print("✓ 模型前向传播测试通过（忽略预期内的NotImplementedError）")
-            else:
-                # 其他错误则测试失败
-                self.fail(f"模型前向传播测试失败: {str(e)}")
-    
-    def test_attention_mask_shape_non_llava(self):
-        """当非LLaVA-3D时，注意力掩码应为4维因果掩码"""
-        print("测试非LLaVA-3D注意力掩码维度...")
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        self.model.config.use_llava3d = False
-        # 使用非首步以触发_update_causal_mask
-        cache_position = torch.tensor([1], dtype=torch.long)
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=self.test_token_type_ids,
-            cache_position=cache_position,
-            use_cache=True,
-        )
-        self.assertEqual(model_inputs["attention_mask"].dim(), 4, "非LLaVA-3D路径 attention_mask 应为4维因果掩码")
-        print("✓ 非LLaVA-3D注意力掩码维度测试通过")
-
-    def test_intrinsic_presence(self):
-        """prepare_inputs_for_generation应保留intrinsic字段"""
-        print("测试intrinsic字段保留...")
-        input_ids = self.test_input_ids.clone()
-        attention_mask = self.test_attention_mask.clone()
-        intrinsic = torch.eye(3)
-        # LLaVA-3D首步
-        self.model.config.use_llava3d = True
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            intrinsic=intrinsic,
-            cache_position=torch.tensor([0]),
-            past_key_values=HybridCache.__new__(HybridCache),
-            use_cache=True,
-        )
-        self.assertIn("intrinsic", model_inputs, "model_inputs中应包含intrinsic")
-        # 非首步
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            intrinsic=intrinsic,
-            cache_position=torch.tensor([1]),
-            use_cache=True,
-        )
-        self.assertIn("intrinsic", model_inputs, "非首步也应保留intrinsic")
-        print("✓ intrinsic字段保留测试通过")
-
-    def test_pixel_values_without_image_token_raises(self):
-        """当没有图像token但注入pixel_values时，应报错以避免尺寸不匹配"""
-        print("测试缺少图像token时报错...")
-        input_ids = self.test_input_ids.clone()
-        # 移除所有图像token
-        input_ids[input_ids == self.config.image_token_index] = 0
-        attention_mask = self.test_attention_mask.clone()
-        inputs_embeds = self.test_inputs_embeds.clone()
-        pixel_values = torch.randn(input_ids.shape[0], 3, 224, 224)
-
-        # 伪造图像特征函数以避免真实视觉前向，同时制造尺寸不匹配
-        import types
-        def _fake_image_features(self_model, pixel_values_t, intrinsic_t):
-            bsz = pixel_values_t.shape[0]
-            return torch.randn(bsz, 1, self_model.config.text_config.hidden_size)
-        original_get_image_features = self.model.get_image_features
-        try:
-            self.model.get_image_features = types.MethodType(_fake_image_features, self.model)
-            with self.assertRaises(ValueError):
-                _ = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    inputs_embeds=inputs_embeds,
-                    pixel_values=pixel_values,
-                    return_dict=True,
-                )
-            print("✓ 缺少图像token时报错测试通过")
-        finally:
-            self.model.get_image_features = original_get_image_features
-
-    def test_image_token_no_conversion_when_index_matches(self):
-        """当config.image_token_index已等于LLaVA-3D索引时，input_ids不应被修改"""
-        print("测试图像token索引相等时不转换...")
-        # 强制将配置的图像token索引设为LLaVA-3D常量
-        self.model.config.image_token_index = IMAGE_TOKEN_INDEX
-        # 构造包含LLaVA-3D图像token的输入
-        input_ids = torch.tensor([
-            [1, 2, 3, IMAGE_TOKEN_INDEX, 4, 5, 6],
-        ], dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids)
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            cache_position=torch.tensor([0]),
-            past_key_values=HybridCache.__new__(HybridCache),
-            use_cache=True,
-        )
-        self.assertTrue(torch.equal(model_inputs.get("input_ids", input_ids), input_ids), "索引相等时不应改动input_ids")
-        print("✓ 图像token索引相等时不转换测试通过")
-    
-    def test_integration_end_to_end(self):
-        """端到端集成测试"""
-        # 如果提供了实际模型路径，则进行端到端测试
-        if self.args.model_path and self.args.llava3d_path:
-            print("执行端到端集成测试...")
-            
+            tokenizer = AutoTokenizer.from_pretrained(cls.args.language_model_path, use_fast=True)
+        except Exception:
             try:
-                # 加载实际模型（若缺少预处理配置则跳过该用例）
-                from pathlib import Path
-                model_dir = Path(self.args.model_path)
-                preproc_ok = (model_dir / "preprocessor_config.json").exists() or (model_dir / "processor_config.json").exists()
-                if not preproc_ok:
-                    print("⚠ 跳过端到端测试：模型目录缺少预处理配置文件 preprocessor_config.json/processor_config.json")
-                    return
-                processor = AutoProcessor.from_pretrained(self.args.model_path, trust_remote_code=True)
-                model = SpatialVLAForCausalLM.from_pretrained(
-                    self.args.model_path, 
-                    trust_remote_code=True,
-                    torch_dtype=torch.float16
-                ).to(self.device)
-                
-                # 设置use_llava3d=True
-                model.config.use_llava3d = True
-                
-                # 加载测试图像
-                image_path = Path(__file__).parent / "example.png"
-                if image_path.exists():
-                    image = Image.open(image_path).convert("RGB")
-                    
-                    # 准备输入
-                    prompt = "What action should the robot take to pick the cup?"
-                    inputs = processor(images=[image], text=prompt, return_tensors="pt").to(self.device)
-                    
-                    # 执行推理
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=100,
-                            do_sample=True,
-                            temperature=0.7,
-                            top_p=0.9,
-                        )
-                    
-                    # 解码输出
-                    generated_text = processor.batch_decode(outputs, skip_special_tokens=True)[0]
-                    print(f"生成的文本: {generated_text}")
-                    
-                    print("✓ 端到端集成测试通过")
-                else:
-                    print("⚠ 跳过端到端测试：测试图像不存在")
-            except Exception as e:
-                print(f"⚠ 端到端集成测试失败: {str(e)}")
+                tokenizer = AutoTokenizer.from_pretrained(cls.args.language_model_path, use_fast=False)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        img_processor = AutoImageProcessor.from_pretrained(vision_path)
+        # 补充 image_seq_length 属性供 Processor 使用
+        seq_len = int(getattr(cls.config.text_config, "num_image_tokens", 1))
+        setattr(img_processor, "image_seq_length", seq_len)
+        from model.processing_spatialvla_dev import SpatialVLAProcessor
+        # 传入必要的processor配置
+        statistics = {"default": {"action": {"q01": [0,0,0], "q99": [1,1,1], "mask": [1,1,1]}}}
+        intrinsic_config = {"default": {"width": 224, "height": 224, "intrinsic": [[200,0,112],[0,200,112],[0,0,1]]}}
+        # Minimal, explicit bin configuration for SpatialActionTokenizer
+        action_config = {
+            "num_bins": {
+                "translation": {"theta_bins": 4, "phi_bins": 4, "r_bins": 4},
+                "rotation": {"roll_bins": 4, "pitch_bins": 4, "yaw_bins": 4},
+                "gripper": 2,
+            },
+            "use_spherical": False,
+        }
+        # Provide explicit uniform bin boundaries (len = bins + 1)
+        bin_policy = {
+            "translation": {
+                "theta_bins": [0.0, 0.785398, 1.570796, 2.356194, 3.141593],
+                "phi_bins": [-3.141593, -1.570796, 0.0, 1.570796, 3.141593],
+                "r_bins": [0.0, 0.433013, 0.866025, 1.299038, 1.732051],
+            },
+            "rotation": {
+                "roll_bins": [-1.0, -0.5, 0.0, 0.5, 1.0],
+                "pitch_bins": [-1.0, -0.5, 0.0, 0.5, 1.0],
+                "yaw_bins": [-1.0, -0.5, 0.0, 0.5, 1.0],
+            },
+        }
+        processor = SpatialVLAProcessor(
+            image_processor=img_processor,
+            tokenizer=tokenizer,
+            statistics=statistics,
+            bin_policy=bin_policy,
+            intrinsic_config=intrinsic_config,
+            action_config=action_config,
+        )
+        # 使用用户提供的真实图片路径（如果存在），否则创建一个占位图片
+        img_path = cls.args.image_path
+        if img_path and os.path.exists(img_path):
+            image = Image.open(img_path).convert("RGB")
         else:
-            print("⚠ 跳过端到端测试：未提供模型路径")
+            image = Image.new('RGB', (224, 224), color = 'blue')
+        prompts = ["Describe the image.", "Describe again."]
+        inputs = processor(
+            images=[image, image],
+            text=prompts,
+            return_tensors="pt",
+        )
+        # 保存原始processor输出用于前向测试（不插入额外占位符）
+        cls.inputs_forward = inputs
+        # 构造一个仅用于转换测试的变体：在开头插入一个占位符 sentinel
+        cls.real_image_token_id = int(inputs["image_token_id"]) if isinstance(inputs["image_token_id"], int) else int(inputs["image_token_id"]) 
+        input_ids_conv = inputs["input_ids"].clone()
+        input_ids_conv[0, 0] = cls.spatialvla_placeholder_idx
+        cls.inputs_convert = {**inputs, "input_ids": input_ids_conv}
+    
+    def test_token_conversion_is_unconditional(self):
+        """测试特殊标记转换逻辑"""
+        print("\n测试特殊标记转换逻辑...")
+        model_inputs = self.model.prepare_inputs_for_generation(
+            input_ids=self.inputs_convert["input_ids"].clone(),
+            image_token_index=self.inputs_convert["image_token_index"],
+            image_token_id=self.inputs_convert["image_token_id"],
+        )
+        converted_input_ids = model_inputs["input_ids"]
+        original_placeholder_pos = (self.inputs_convert["input_ids"] == self.spatialvla_placeholder_idx)
+        original_real_id_pos = (self.inputs_convert["input_ids"] == self.inputs_convert["image_token_id"]) 
 
+        self.assertTrue(torch.all(converted_input_ids[original_placeholder_pos] == LLAVA3D_IMAGE_TOKEN_INDEX))
+        self.assertTrue(torch.all(converted_input_ids[original_real_id_pos] == LLAVA3D_IMAGE_TOKEN_INDEX))
+        print("✓ 占位符和真实图像Token ID均被正确转换为LLaVA哨兵值")
+
+    def test_forward_pass_with_pixel_values(self):
+        """测试带有图像输入的模型前向传播"""
+        print("\n测试模型前向传播...")
+        try:
+            inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in self.inputs_forward.items()}
+            outputs = self.model(
+                **inputs,
+                return_dict=True,
+            )
+            self.assertIsNotNone(outputs.loss)
+            self.assertIsNotNone(outputs.logits)
+            print("✓ 模型前向传播（带图像）测试通过")
+        except Exception as e:
+            self.fail(f"模型前向传播（带图像）测试失败: {e}")
+
+    def test_integration_end_to_end(self):
+        """端到端集成测试，使用真实模型（如果路径被提供）"""
+        # 仅在提供整合好的 VLA 目录时才进行端到端测试
+        if not (self.args.spatialvla_model_path and os.path.isdir(self.args.spatialvla_model_path)):
+            print("\n⚠ 跳过端到端测试：需要一个整合好的 VLA 目录 (--spatialvla_model_path)")
+            return
+
+        print("\n执行端到端集成测试...")
+        
+        try:
+            # 仅使用整合好的 VLA 目录进行端到端加载
+            model = SpatialVLAForConditionalGeneration.from_pretrained(
+                self.args.spatialvla_model_path,
+            ).to(self.device)
+            
+            # 假设processor与整合好的VLA模型相关联
+            processor = AutoProcessor.from_pretrained(self.args.spatialvla_model_path, trust_remote_code=True)
+
+            print(f"[E2E] 模型加载成功。语言模型: {model.config.language_model_name_or_path}")
+            print(f"[E2E] 视觉模型来源: {model.config.vision_weight_source}, 路径: {model.config.vision_model_name_or_path}")
+            
+            # 2. 准备输入
+            img_path = self.args.image_path
+            if img_path and os.path.exists(img_path):
+                image = Image.open(img_path).convert("RGB")
+            else:
+                image = Image.new('RGB', (224, 224), color = 'blue')
+            prompt = "Describe the image."
+            inputs = processor(images=[image], text=prompt, return_tensors="pt")
+            inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+
+            print(f"[E2E] 输入准备成功，keys: {list(inputs.keys())}")
+            
+            # 3. 执行推理
+            with torch.no_grad():
+                outputs = model.generate(**inputs, max_new_tokens=10)
+            
+            # 4. 解码
+            generated_text = processor.batch_decode(outputs, skip_special_tokens=True)[0]
+            print(f"[E2E] 生成的文本: {generated_text}")
+            self.assertTrue(len(generated_text) > 0)
+            
+            print("✓ 端到端集成测试通过")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.fail(f"端到端集成测试失败: {e}")
 
 if __name__ == "__main__":
-    # 运行所有测试
-    unittest.main()
+    # 解析所有已知参数，并将其打包到环境变量中
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--language_model_path", type=str)
+    parser.add_argument("--vision_model_path", type=str)
+    parser.add_argument("--spatialvla_model_path", type=str)
+    parser.add_argument("--device", type=str)
+    
+    # 将 sys.argv 分为已知参数和 unittest 参数
+    known_args, remaining_argv = parser.parse_known_args()
+    
+    # 将已知参数格式化为字符串，以便 setUpClass 解析
+    test_args_list = []
+    for key, value in vars(known_args).items():
+        if value is not None:
+            test_args_list.append(f"--{key}={value}")
+    os.environ["TEST_ARGS"] = " ".join(test_args_list)
+    
+    # 运行 unittest，只传递它自己的参数
+    unittest.main(argv=[sys.argv[0]] + remaining_argv)
