@@ -31,6 +31,8 @@ def main():
             try:
                 tokenizer = AutoTokenizer.from_pretrained(args.language_model_path, use_fast=False)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 tokenizer = AutoTokenizer.from_pretrained("gpt2")
         image_processor = AutoImageProcessor.from_pretrained(args.vision_model_path)
         # Inject image_seq_length for patch-world expansion
