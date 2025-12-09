@@ -12,6 +12,7 @@ def main():
     parser = argparse.ArgumentParser("Huggingface AutoModel Testing (dev)")
     parser.add_argument("--language_model_path", required=True, help="Language model path (LLaVA-3D)")
     parser.add_argument("--vision_model_path", required=True, help="Vision model path (SigLIP or LLaVA vision)")
+    parser.add_argument("--map_anything_model_path", required=True, help="MapAnything model path")
     parser.add_argument("--spatialvla_model_path", default=None, help="Integrated SpatialVLA checkpoint path (optional)")
     parser.add_argument("--image_path", default=None, help="Test image path")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
@@ -33,7 +34,8 @@ def main():
             except Exception:
                 import traceback
                 traceback.print_exc()
-                tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                raise ValueError("Cannot load tokenizer from language model path.")
+                # tokenizer = AutoTokenizer.from_pretrained("gpt2")
         image_processor = AutoImageProcessor.from_pretrained(args.vision_model_path)
         # Inject image_seq_length for patch-world expansion
         seq_len = (image_processor.size["height"] // getattr(image_processor, "patch_size", 14)) ** 2 if hasattr(image_processor, "size") else 256
@@ -72,6 +74,7 @@ def main():
         config = SpatialVLAConfig(
             language_model_name_or_path=args.language_model_path,
             vision_model_name_or_path=args.vision_model_path,
+            map_anything_model_name_or_path=args.map_anything_model_path,
             image_token_index=256000,
             ignore_index=-100,
         )

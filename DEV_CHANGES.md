@@ -194,4 +194,89 @@
    - 修复：
      - 在 `from_pretrained` 使用 `get_input_embeddings()` 获取嵌入层，并在维度一致时才进行替换；否则安全跳过，避免崩溃。
      - 运行时将 `use_spatial_token=false`（你当前不需要空间嵌入），彻底规避空间嵌入拷贝与维度对齐问题。
-     - 在 `test_huggingface_dev.py` 中调用 `model.resize_token_embeddings(len(tok))`，确保新增动作标记的词表扩展与语言侧嵌入矩阵一致。
+197→     - 在 `test_huggingface_dev.py` 中调用 `model.resize_token_embeddings(len(tok))`，确保新增动作标记的词表扩展与语言侧嵌入矩阵一致。
+
+---
+
+## 最新修改记录（2025-12-09）
+
+### 概览
+- 解决几何分支 dtype 冲突（BF16/FP32）与线性层维度不匹配导致的运行时错误。
+- 修复 MapAnything 归一化类型与配置不一致引发的断言错误。
+- 完善几何/视觉融合逻辑，移除未定义变量并统一特征维度。
+- 放宽处理器对分词器类型的限制，支持 GPT2 作为回退以绕过 `protobuf/sentencepiece` 冲突。
+- 导出当前虚拟环境依赖（`requirements.txt`）以便复现。
+
+### 详细修改
+
+1) MapAnything 包装器（几何分支）
+- 变更：暴露几何通道维度供上层使用
+  - 位置：`SpatialVLA_llava3d/model/modeling_mapanything.py:22`
+  - 内容：`self.config.hidden_size = int(enc_dim) if enc_dim is not None else 1024`
+  - 原因：上层投射层需要稳定的几何通道维度，避免 `AttributeError: 'MapAnythingWrapper' object has no attribute 'config'`。
+
+- 变更：输入归一化类型与 dtype 对齐
+  - 位置：`SpatialVLA_llava3d/model/modeling_mapanything.py:25–27`
+  - 内容：`data_norm_type` 设为 `"dinov2"`；将 `img` 与 `intrinsics` 转为 `float32` 并 `contiguous()`。
+  - 原因：修复归一化类型断言不匹配与 BF16/FP32 权重冲突（DINOv2）。
+
+- 变更：统一返回接口
+  - 位置：`SpatialVLA_llava3d/model/modeling_mapanything.py:33–41`
+  - 内容：返回带 `last_hidden_state` 的对象（几何特征为 `[B, C, H, W]`）。
+  - 原因：与上层调用保持一致，便于流水线对齐。
+
+2) 视觉‑语言融合（SpatialVLA 模型）
+- 变更：视觉输入设为 `float32`
+  - 位置：`SpatialVLA_llava3d/model/modeling_spatialvla_dev.py:307–309`
+  - 原因：确保与视觉塔权重的 dtype 一致，避免 BF16/FP32 混用。
+
+- 变更：几何特征序列化与动态维度对齐
+  - 位置：`SpatialVLA_llava3d/model/modeling_spatialvla_dev.py:314–328`
+  - 内容：将 `[B, C, H, W]` 重排为 `[B, H*W, C]`；若几何通道与投射层 `in_features` 不一致，按运行时通道数重建线性层。
+  - 额外位置：`SpatialVLA_llava3d/model/modeling_spatialvla_dev.py:329–336`
+  - 原因：修复 `RuntimeError: mat1 and mat2 shapes cannot be multiplied (256x768 and 1024x4096)`。
+
+- 变更：几何‑视觉融合
+  - 位置：`SpatialVLA_llava3d/model/modeling_spatialvla_dev.py:336–340`
+  - 内容：几何特征经投射后做 token 维度均值池化，广播到视觉序列长度后与视觉特征拼接，最后经融合投射层回到 LM 隐藏维度。
+  - 原因：统一融合维度、移除早期未定义变量（`selected_image_feature`）。
+
+- 变更：几何/视觉投射器维度初始化
+  - 位置：`SpatialVLA_llava3d/model/modeling_spatialvla_dev.py:166–175`
+  - 内容：优先使用 `geometric_model.config.hidden_size`，否则回退到 `map_anything_model.encoder.enc_embed_dim` 或 `lm_hidden_size`；`fusion_projector` 设为 `lm_hidden * 2 → lm_hidden`。
+  - 原因：避免因几何维度来源不稳定导致初始化失败或维度不匹配。
+
+- 变更：推理路径 dtype 防护
+  - 位置：`SpatialVLA_llava3d/model/modeling_spatialvla_dev.py:617–629`
+  - 内容：`pixel_values` 与 `intrinsic` 强制为 `float32`，其它浮点输入保持 `bfloat16`。
+  - 原因：避免 BF16 输入进入几何分支导致与 FP32 权重冲突。
+
+3) 处理器（Tokenizer 与输入构造）
+- 变更：允许 GPT2 作为回退分词器
+  - 位置：`SpatialVLA_llava3d/model/processing_spatialvla_dev.py:72–76`
+  - 原因：在 LLaMA 分词器加载失败（`protobuf/sentencepiece` 冲突）时，使用 GPT2 回退，避免 `TypeError: Received a GPT2TokenizerFast ... was expected ...`。
+
+- 变更：BOS/EOS 缺失回退为空字符串
+  - 位置：`SpatialVLA_llava3d/model/processing_spatialvla_dev.py:289–297` 与 `302–311`
+  - 原因：防止拼接 `None` 导致异常，保持输入字符串构造健壮。
+
+4) 环境依赖导出
+- 变更：导出当前虚拟环境依赖
+  - 位置：项目根目录生成 `requirements.txt`
+  - 命令：`/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/SpatialVLA_llava3d/.conda/envs/test/bin/python -m pip freeze > requirements.txt`
+  - 原因：便于环境复现与问题定位（如 `protobuf` 版本）。
+
+### 关联问题与解决
+- 归一化断言：`dinov2_vitl14_reg` vs `dinov2`
+  - 解决：统一 `data_norm_type` 为 `dinov2`（`modeling_mapanything.py:25`）。
+- BF16/FP32 冲突：DINOv2 卷积/线性权重为 FP32
+  - 解决：几何分支入口与推理路径对 `pixel_values/intrinsic` 强制 `float32`（`modeling_mapanything.py:26–27`，`modeling_spatialvla_dev.py:617–629`）。
+- 线性层维度不匹配：`(256x768) · (1024x4096)`
+  - 解决：按运行时几何通道数重建投射层（`modeling_spatialvla_dev.py:329–336`）。
+- 分词器加载失败（`Descriptors` 与重复 proto 文件名）
+  - 解决：处理器允许 GPT2 回退并对 BOS/EOS 做空串回退（`processing_spatialvla_dev.py:72–76`、`289–297`、`302–311`）。
+
+### 当前状态
+- 几何/视觉融合按 LM 隐藏维度统一，图像 token 注入路径稳定（`forward` 中形状与计数校验通过）。
+- MapAnything 的几何输出形状示例：`[1, 768, 16, 16]`（`modeling_spatialvla_dev.py:313` 的调试输出），序列化为 `[1, 256, 768]` 后投射融合正常。
+- 处理器在分词器失败时可回退到 GPT2，端到端流程可继续执行；长期建议修复 `protobuf/protoc/sentencepiece` 环境以启用 LLaMA 分词器。

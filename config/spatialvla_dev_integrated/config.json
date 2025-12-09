@@ -6,6 +6,7 @@
   },
   "language_model_name_or_path": "/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/model_zoo/llava3d_7B",
   "vision_model_name_or_path": "/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/model_zoo/siglip-so400m-patch14-224",
+  "map_anything_model_name_or_path": "/cpfs01/qianfy_workspace/openvla_oft_rl/zzq_vla/SpatialVLA_llava3d/model_zoo/mapanything",
   "image_token_index": 256000,
   "ignore_index": -100,
   "vision_config": {

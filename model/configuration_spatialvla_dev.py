@@ -34,6 +34,7 @@ class SpatialVLAConfig(PretrainedConfig):
         text_config=None,
         vision_model_name_or_path="google/siglip-so400m-patch14-224",
         language_model_name_or_path=None,
+        map_anything_model_name_or_path=None,
         vision_weight_source="siglip_official",
         spatialvla_vision_pretrained_path=None,
         ignore_index=None,
@@ -53,9 +54,12 @@ class SpatialVLAConfig(PretrainedConfig):
     ):
         if language_model_name_or_path is None and text_config is None:
             raise ValueError("Provide either `language_model_name_or_path` or a complete `text_config` for integrated checkpoints.")
-
+        if map_anything_model_name_or_path is None:
+            raise ValueError("Provide `map_anything_model_name_or_path` for MapAnything model.")
+        
         self.vision_model_name_or_path = vision_model_name_or_path
         self.language_model_name_or_path = language_model_name_or_path
+        self.mapanything_model_name_or_path = map_anything_model_name_or_path
         self.vision_weight_source = vision_weight_source
         self.spatialvla_vision_pretrained_path = spatialvla_vision_pretrained_path
         # 根据 LLaVA-3D 协议设置 ignore_index（可被覆盖）

@@ -173,3 +173,8 @@ petrel_client
 huggingface/tmp
 pretrainedmodel_zoo/
 model_zoo/
+.conda/
+<<<<<<< Updated upstream
+model/map-anything/
+=======
+>>>>>>> Stashed changes

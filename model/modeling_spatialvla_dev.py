@@ -32,6 +32,7 @@ from transformers.utils import (
 )
 from .configuration_spatialvla_dev import SpatialVLAConfig
 from .modeling_llava3d_v2 import LLaVA3DForCausalLMV2
+from .modeling_mapanything import MapAnythingWrapper
 # TODO(temporarily disable MapAnything):
 # from .modeling_mapanything import MapAnythingWrapper
 
@@ -98,7 +99,6 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
 
         # 视觉塔严格从纯视觉 config 构建（通过方法以便单测可 mock）
         self.vision_tower = vision_model or self._init_vision_tower()
-
         # 语言塔：训练构建时从路径加载；整合权重加载时直接根据 text_config 构造空结构
         if language_model is not None:
             self.language_model = language_model
@@ -114,6 +114,9 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             except Exception:
                 # Final fallback: construct minimal wrapper with text_config to satisfy tests
                 self.language_model = LLaVA3DForCausalLMV2(config.text_config)
+        self.geometric_model = MapAnythingWrapper(config)
+        # This is the first MLP that map the mapanything output(1024 dims) to the siglip ourput(1052 dims)
+        # self.geometric_projector = nn.Linear(1024, config.vision_config.hidden_size)
         if getattr(self.language_model, "_tied_weights_keys", None) is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
 
@@ -160,8 +163,15 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         # TODO(temporarily disable MapAnything): comment out geometric pipeline for now
         # self.geometric_model = MapAnythingWrapper(config)
         # This is the first MLP that map the mapanything output(1024 dims) to the siglip ourput(1052 dims)
-        # self.geometric_projector = nn.Linear(self.map_anything.config.hidden_size, self.vision_tower.config.hidden_size)
-        # self.fusion_projector = nn.Linear(self.vision_tower.config.hidden_size * 2, self.language_model.config.hidden_size)
+        _geom_cfg = getattr(self.geometric_model, "config", None)
+        _geom_dim = None
+        if _geom_cfg is not None and hasattr(_geom_cfg, "hidden_size"):
+            _geom_dim = int(_geom_cfg.hidden_size)
+        else:
+            _encoder = getattr(getattr(self.geometric_model, "map_anything_model", None), "encoder", None)
+            _geom_dim = int(getattr(_encoder, "enc_embed_dim", lm_hidden_size)) if _encoder is not None else lm_hidden_size
+        self.geometric_projector = nn.Linear(_geom_dim, vision_hidden_size)
+        self.fusion_projector = nn.Linear(vision_hidden_size * 2, lm_hidden_size)
 
         def _spatialvla_encode_images(self, pixel_values):
             return pixel_values
@@ -294,18 +304,50 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         return causal_mask
 
     def get_image_features(self, pixel_values: torch.FloatTensor, intrinsic: torch.FloatTensor):
-        # Patch-world encoding: vision tower returns [B, N_v, C_v]; projector maps to LM hidden
         siglip_pixel_values = TF.normalize(pixel_values, mean=SIGLIP_MEAN, std=SIGLIP_STD)
+        siglip_pixel_values = siglip_pixel_values.float().contiguous()
         image_outputs = self.vision_tower(siglip_pixel_values)
         feats = image_outputs.last_hidden_state
-        image_features = self.multi_modal_projector(feats)
+        # image_features = self.multi_modal_projector(feats)
+        geometric_features = self.geometric_model(pixel_values=pixel_values, intrinsics=intrinsic).last_hidden_state
+        # print(f"[Debug]geometric_features shape: {geometric_features.shape}")
+        if geometric_features.dim() == 4:
+            b, c, h, w = geometric_features.shape
+            geom_seq = geometric_features.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        elif geometric_features.dim() == 3:
+            raise NotImplementedError(f"geometric_features dim {geometric_features.dim()} != 4")
+            # b, x, y = geometric_features.shape
+            # _geom_cfg = getattr(self.geometric_model, "config", None)
+            # _geom_dim = None
+            # if _geom_cfg is not None and hasattr(_geom_cfg, "hidden_size"):
+            #     _geom_dim = int(_geom_cfg.hidden_size)
+            # else:
+            #     _encoder = getattr(getattr(self.geometric_model, "map_anything_model", None), "encoder", None)
+            #     _geom_dim = int(getattr(_encoder, "enc_embed_dim", y)) if _encoder is not None else y
+            # geom_seq = geometric_features if y == _geom_dim else geometric_features.permute(0, 2, 1)
+        else:
+            raise NotImplementedError(f"geometric_features dim {geometric_features.dim()} != 4")
+            # geom_seq = geometric_features.unsqueeze(1)
+        lm_hidden_size = int(self.config.text_config.hidden_size)
+        geom_dim = int(geom_seq.shape[-1])
+        if getattr(self.geometric_projector, "in_features", None) != geom_dim:
+            raise NotImplementedError(f"geometric_projector in_features {geom_dim} != geom_seq shape[-1] {geom_dim}")
+            # device = self.geometric_projector.weight.device if hasattr(self.geometric_projector, "weight") else image_features.device
+            # dtype = self.geometric_projector.weight.dtype if hasattr(self.geometric_projector, "weight") else image_features.dtype
+            # self.geometric_projector = nn.Linear(geom_dim, lm_hidden_size)
+            # self.geometric_projector = self.geometric_projector.to(device=device, dtype=dtype)
+        projected_geometric_features = self.geometric_projector(geom_seq).to(feats.dtype)
+        # geom_global = projected_geometric_features.mean(dim=1, keepdim=True)
+        # geom_broadcast = geom_global.expand(feats.shape[0], feats.shape[1], geom_global.shape[-1])
+        fused_features = torch.cat([feats, geom_broadcast], dim=-1)
+        projected_fused_features = self.fusion_projector(fused_features)
         # Align config num_image_tokens on first call or if changed vision tower
-        seq_len = int(image_features.shape[1])
+        seq_len = int(projected_fused_features.shape[1])
         current = getattr(self.config.text_config, "num_image_tokens", None)
         if current is None or current != seq_len:
             self.config.text_config.num_image_tokens = seq_len
             setattr(self.config, "image_seq_length", seq_len)
-        return image_features
+        return projected_fused_features
 
     def forward(
         self,
@@ -575,16 +617,19 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         self,
         model_inputs,
     ) -> torch.Tensor:
-        def _move(v):
+        def _move_field(k, v):
             if hasattr(v, "to"):
                 if torch.is_floating_point(v):
-                    v = v.to(dtype=torch.bfloat16)
+                    if k in ("pixel_values", "intrinsic"):
+                        v = v.to(dtype=torch.float32)
+                    else:
+                        v = v.to(dtype=torch.bfloat16)
                 v = v.to(self.device)
             return v
         if isinstance(model_inputs, dict):
-            model_inputs = {k: _move(v) for k, v in model_inputs.items()}
+            model_inputs = {k: _move_field(k, v) for k, v in model_inputs.items()}
         else:
-            model_inputs = _move(model_inputs)
+            model_inputs = _move_field("_", model_inputs)
         input_len = model_inputs["input_ids"].shape[-1]
         generation_outputs = self.generate(**model_inputs, max_new_tokens=256, do_sample=False, use_cache=False)
         return generation_outputs[:, input_len:]
