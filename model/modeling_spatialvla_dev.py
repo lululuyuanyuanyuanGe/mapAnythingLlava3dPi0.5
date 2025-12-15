@@ -170,7 +170,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         else:
             _encoder = getattr(getattr(self.geometric_model, "map_anything_model", None), "encoder", None)
             _geom_dim = int(getattr(_encoder, "enc_embed_dim", lm_hidden_size)) if _encoder is not None else lm_hidden_size
-        self.geometric_projector = nn.Linear(_geom_dim, vision_hidden_size)
+        self.geometric_projector = nn.Linear(768, vision_hidden_size)
         self.fusion_projector = nn.Linear(vision_hidden_size * 2, lm_hidden_size)
 
         def _spatialvla_encode_images(self, pixel_values):
@@ -330,15 +330,15 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             # geom_seq = geometric_features.unsqueeze(1)
         lm_hidden_size = int(self.config.text_config.hidden_size)
         geom_dim = int(geom_seq.shape[-1])
-        if getattr(self.geometric_projector, "in_features", None) != geom_dim:
-            raise NotImplementedError(f"geometric_projector in_features {geom_dim} != geom_seq shape[-1] {geom_dim}")
-            # device = self.geometric_projector.weight.device if hasattr(self.geometric_projector, "weight") else image_features.device
-            # dtype = self.geometric_projector.weight.dtype if hasattr(self.geometric_projector, "weight") else image_features.dtype
-            # self.geometric_projector = nn.Linear(geom_dim, lm_hidden_size)
-            # self.geometric_projector = self.geometric_projector.to(device=device, dtype=dtype)
+        # if getattr(self.geometric_projector, "in_features", None) != geom_dim:
+        #     raise NotImplementedError(f"geometric_projector in_features {geom_dim} != geom_seq shape[-1] {geom_dim}")
+        #     # device = self.geometric_projector.weight.device if hasattr(self.geometric_projector, "weight") else image_features.device
+        #     # dtype = self.geometric_projector.weight.dtype if hasattr(self.geometric_projector, "weight") else image_features.dtype
+        #     # self.geometric_projector = nn.Linear(geom_dim, lm_hidden_size)
+        #     # self.geometric_projector = self.geometric_projector.to(device=device, dtype=dtype)
         projected_geometric_features = self.geometric_projector(geom_seq).to(feats.dtype)
-        # geom_global = projected_geometric_features.mean(dim=1, keepdim=True)
-        # geom_broadcast = geom_global.expand(feats.shape[0], feats.shape[1], geom_global.shape[-1])
+        geom_global = projected_geometric_features.mean(dim=1, keepdim=True)
+        geom_broadcast = geom_global.expand(feats.shape[0], feats.shape[1], geom_global.shape[-1])
         fused_features = torch.cat([feats, geom_broadcast], dim=-1)
         projected_fused_features = self.fusion_projector(fused_features)
         # Align config num_image_tokens on first call or if changed vision tower
