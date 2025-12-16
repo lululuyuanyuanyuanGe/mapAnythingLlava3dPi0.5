@@ -39,6 +39,7 @@ class SpatialVLAConfig(PretrainedConfig):
         ego3d_patch_reso=4,
         n_freqs=8,
         use_vision_zoe=True,
+        action_expert_config=None,
         **kwargs,
     ):
         self._ignore_index = ignore_index
@@ -90,6 +91,13 @@ class SpatialVLAConfig(PretrainedConfig):
             self.vision_zoe_config = CONFIG_MAPPING[vision_zoe_config["model_type"]](**vision_zoe_config)
         else:
             pass
+
+        # Action Expert Config
+        self.action_expert_config = action_expert_config
+        if isinstance(self.action_expert_config, dict):
+             # Default to Gemma if model_type not specified, or use the one provided
+            expert_type = self.action_expert_config.get("model_type", "gemma")
+            self.action_expert_config = CONFIG_MAPPING[expert_type](**self.action_expert_config)
 
         # additional attributes
         self.action_token_begin_idx = action_token_begin_idx

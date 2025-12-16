@@ -32,6 +32,7 @@ from transformers.utils import (
 from .configuration_spatialvla import SpatialVLAConfig
 from .modeling_gemma2 import Gemma2ForCausalLM
 from transformers import AutoModel, ZoeDepthForDepthEstimation
+from .modeling_flow_expert import FlowMatchingActionExpert
 
 SIGLIP_MEAN, SIGLIP_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
 ZOE_MEAN, ZOE_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
@@ -190,6 +191,17 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         else:
             self.spatial_embed_tokens = None
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+
+        # Action Expert Initialization
+        if getattr(config, "action_expert_config", None) is not None:
+            self.action_expert = FlowMatchingActionExpert(
+                config.action_expert_config,
+                action_dim=getattr(config, "action_dim", 14), 
+                action_horizon=getattr(config, "action_horizon", 1),
+                vlm_hidden_size=config.text_config.hidden_size
+            )
+        else:
+            self.action_expert = None
 
 
     def backproject_patch(self, K: torch.Tensor, depth: torch.Tensor, patch_size=14, reso=2) -> torch.Tensor:
@@ -404,11 +416,25 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=output_hidden_states or (actions is not None and self.action_expert is not None),
             return_dict=return_dict,
             cache_position=cache_position,
             num_logits_to_keep=num_logits_to_keep,
         )
+
+        # Flow Matching Training
+        if actions is not None and self.action_expert is not None:
+             last_hidden_state = outputs.hidden_states[-1]
+             action_loss = self.action_expert.compute_loss(last_hidden_state, actions)
+             
+             return SpatialVLACausalLMOutputWithPast(
+                loss=action_loss,
+                logits=None, 
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                image_hidden_states=image_features if pixel_values is not None else None,
+            )
 
         logits = outputs.logits
         loss = None
@@ -486,6 +512,18 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         self,
         model_inputs,
     ) -> torch.Tensor:
+        
+        # New Flow Matching Inference
+        if getattr(self, "action_expert", None) is not None:
+            model_inputs = model_inputs.to(torch.bfloat16).to(self.device)
+            # Run VLM backbone
+            outputs = self.language_model(**model_inputs, output_hidden_states=True)
+            last_hidden_state = outputs.hidden_states[-1]
+            # Sample Actions
+            actions = self.action_expert.sample_actions(last_hidden_state)
+            return actions
+
+        # Legacy AR Inference
         model_inputs = model_inputs.to(torch.bfloat16).to(self.device)
         input_len = model_inputs["input_ids"].shape[-1]
         generation_outputs = self.generate(**model_inputs, max_new_tokens=256, do_sample=False)
