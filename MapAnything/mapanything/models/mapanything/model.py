@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Tuple, Type, Union
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
+from timm.models.layers import Mlp
 
 from mapanything.utils.geometry import (
     apply_log_to_norm,
@@ -239,6 +240,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             ValueError: If invalid configuration options are provided.
         """
         # Initialize Custom Positional Encoding if required
+        info_sharing_config["module_args"]['mlp_layer'] = Mlp 
         custom_positional_encoding = info_sharing_config["custom_positional_encoding"]
         if custom_positional_encoding is not None:
             if isinstance(custom_positional_encoding, str):
