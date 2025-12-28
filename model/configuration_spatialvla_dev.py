@@ -50,6 +50,7 @@ class SpatialVLAConfig(PretrainedConfig):
         n_freqs=8,
         use_vision_zoe=True,
         image_seq_length=None,
+        action_expert_config=None,
         **kwargs,
     ):
         if language_model_name_or_path is None and text_config is None:
@@ -127,6 +128,13 @@ class SpatialVLAConfig(PretrainedConfig):
         else:
             pass
         
+        # Action Expert Config
+        self.action_expert_config = action_expert_config
+        if isinstance(self.action_expert_config, dict):
+             # Default to Gemma if model_type not specified, or use the one provided
+            expert_type = self.action_expert_config.get("model_type", "gemma")
+            self.action_expert_config = CONFIG_MAPPING[expert_type](**self.action_expert_config)
+
         # additional attributes
         self.action_token_begin_idx = action_token_begin_idx
         self.spatial_token_num = spatial_token_num

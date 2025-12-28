@@ -77,6 +77,18 @@ def main():
             map_anything_model_name_or_path=args.map_anything_model_path,
             image_token_index=256000,
             ignore_index=-100,
+            # Add action expert config for testing Flow Matching
+            action_expert_config={
+                "model_type": "gemma",
+                "hidden_size": 256, # Use very small model for fast dev test
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "intermediate_size": 512,
+                "vocab_size": 256000
+            },
+            action_dim=14,
+            action_horizon=8
         )
         model = SpatialVLAForConditionalGeneration(config).eval()
     # Move model to device
@@ -89,7 +101,8 @@ def main():
     if args.image_path and os.path.exists(args.image_path):
         image = Image.open(args.image_path).convert("RGB")
     else:
-        image = Image.open("test/example.png").convert("RGB")
+        # Create a dummy image if test/example.png doesn't exist
+        image = Image.new('RGB', (224, 224), color = 'red')
     images = [image] * args.num_images
 
     prompt = "What action should the robot take to pick the cup?"
@@ -101,9 +114,20 @@ def main():
     # Predict actions (dev model exposes predict_action)
     if hasattr(model, "predict_action"):
         generation_outputs = model.predict_action(inputs)
-        print("generation_outputs:", generation_outputs)
-        actions = processor.decode_actions(generation_outputs, unnorm_key="bridge_orig/1.0.0")
-        print(actions)
+        print("generation_outputs shape:", generation_outputs.shape)
+        
+        # Check if output is continuous (Flow Matching) or discrete tokens (AR)
+        if torch.is_floating_point(generation_outputs):
+             # Flow Matching: output is already continuous actions, just un-normalize
+             # Move to CPU numpy for processor
+             actions_raw = generation_outputs.detach().cpu().numpy()
+             actions = processor.unnormalize_actions(actions_raw, unnorm_key="default")
+             print("Decoded Continuous Actions:", actions)
+        else:
+             # AR: output is token IDs
+             actions = processor.decode_actions(generation_outputs, unnorm_key="default")
+             print("Decoded Discrete Actions:", actions)
+
     else:
         # Fallback to generate
         out = model.generate(**inputs, max_new_tokens=16)

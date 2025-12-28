@@ -238,6 +238,7 @@ class SpatialVLAProcessor(ProcessorMixin):
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
         unnorm_key: Optional[str] = None,
         suffix_actions: Optional[np.array] = None, # (t e)
+        actions: Optional[Union[np.array, torch.Tensor]] = None, # Continuous actions for Flow Matching
         **kwargs: Unpack[PaliGemmaProcessorKwargs],
     ) -> BatchFeature:
         images, text = _validate_images_text_input_order(images, text)
@@ -357,6 +358,9 @@ class SpatialVLAProcessor(ProcessorMixin):
             "image_token_index": self.image_token_index,
             "num_image_tokens": int(self.image_seq_length),
         }
+        
+        if actions is not None:
+            return_data["actions"] = actions
 
         if return_token_type_ids:
             labels = inputs["input_ids"].masked_fill(inputs["token_type_ids"] == 0, -100)
@@ -385,6 +389,59 @@ class SpatialVLAProcessor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
+    def unnormalize_actions(
+        self,
+        normalized_actions: np.ndarray,
+        unnorm_key: Optional[str] = None,
+    ) -> np.ndarray:
+        if unnorm_key is None or (unnorm_key not in self.statistics):
+            logger.warning(f"unnorm_key {unnorm_key} is not in statistics, fallback to default")
+            fallback_key = "default" if ("default" in self.statistics) else next(self.statistics.keys())
+            action_norm_stats = self.statistics[fallback_key]["action"]
+        else:
+            action_norm_stats = self.statistics[unnorm_key]["action"]
+
+        # Align stats length with decoded action dimension
+        decoded_dim = normalized_actions.shape[-1]
+        action_dim = len(action_norm_stats["q01"]) if isinstance(action_norm_stats.get("q01"), (list, np.ndarray)) else decoded_dim
+        mask_cfg = action_norm_stats.get("mask", np.ones(action_dim))
+        mask = np.array(mask_cfg, dtype=bool)
+        action_high = np.array(action_norm_stats.get("q99", [1.0] * action_dim))
+        action_low = np.array(action_norm_stats.get("q01", [-1.0] * action_dim))
+        
+        # If provided stats length mismatches decoded_dim, pad or trim to match
+        if action_high.shape[0] != decoded_dim or action_low.shape[0] != decoded_dim or mask.shape[0] != decoded_dim:
+            default_low = np.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0])
+            default_high = np.array([ 1.0,  1.0,  1.0,  1.0,  1.0,  1.0, 1.0])
+            default_mask = np.ones_like(default_high, dtype=bool)
+            # build arrays of length decoded_dim
+            def _fit(arr, default):
+                arr = np.array(arr)
+                if arr.shape[0] >= decoded_dim:
+                    return arr[:decoded_dim]
+                else:
+                    pad = default[: decoded_dim - arr.shape[0]]
+                    return np.concatenate([arr, pad])
+            action_low = _fit(action_low, default_low)
+            action_high = _fit(action_high, default_high)
+            mask = _fit(mask.astype(float), default_mask).astype(bool)
+
+        # Handle batch dimension if present, otherwise treat as chunks
+        # normalized_actions can be (N, Dim) or (Batch, Time, Dim)
+        # logic below assumes (N, Dim) iteration or vectorized
+        
+        # Vectorized implementation
+        # Expand stats to match input shape
+        # Input: (..., Dim)
+        # Stats: (Dim,)
+        
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
+        return actions
+
     def decode_actions(
         self,
         generation_outputs: torch.Tensor,
@@ -405,45 +462,6 @@ class SpatialVLAProcessor(ProcessorMixin):
         predicted_action_token_ids = predicted_action_token_ids.reshape(-1, action_token_num)
         normalized_action_chunks = self.action_tokenizer.decode_token_ids_to_actions(predicted_action_token_ids)
 
-        if unnorm_key is None or (unnorm_key not in self.statistics):
-            logger.warning(f"unnorm_key {unnorm_key} is not in statistics, fallback to default")
-            fallback_key = "default" if ("default" in self.statistics) else next(self.statistics.keys())
-            action_norm_stats = self.statistics[fallback_key]["action"]
-        else:
-            action_norm_stats = self.statistics[unnorm_key]["action"]
-
-        # Align stats length with decoded action dimension
-        decoded_dim = normalized_action_chunks.shape[1]
-        action_dim = len(action_norm_stats["q01"]) if isinstance(action_norm_stats.get("q01"), (list, np.ndarray)) else decoded_dim
-        mask_cfg = action_norm_stats.get("mask", np.ones(action_dim))
-        mask = np.array(mask_cfg, dtype=bool)
-        action_high = np.array(action_norm_stats.get("q99", [1.0] * action_dim))
-        action_low = np.array(action_norm_stats.get("q01", [-1.0] * action_dim))
-        # If provided stats length mismatches decoded_dim, pad or trim to match
-        if action_high.shape[0] != decoded_dim or action_low.shape[0] != decoded_dim or mask.shape[0] != decoded_dim:
-            default_low = np.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0])
-            default_high = np.array([ 1.0,  1.0,  1.0,  1.0,  1.0,  1.0, 1.0])
-            default_mask = np.ones_like(default_high, dtype=bool)
-            # build arrays of length decoded_dim
-            def _fit(arr, default):
-                arr = np.array(arr)
-                if arr.shape[0] >= decoded_dim:
-                    return arr[:decoded_dim]
-                else:
-                    pad = default[: decoded_dim - arr.shape[0]]
-                    return np.concatenate([arr, pad])
-            action_low = _fit(action_low, default_low)
-            action_high = _fit(action_high, default_high)
-            mask = _fit(mask.astype(float), default_mask).astype(bool)
-            # Note: last dimension assumed gripper; defaults set to [0,1]
-
-        actions = []
-        for normalized_actions in normalized_action_chunks:
-            action = np.where(
-                mask,
-                0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
-                normalized_actions,
-            )
-            actions.append(action)
-        actions = np.stack(actions)
+        actions = self.unnormalize_actions(normalized_action_chunks, unnorm_key)
+        
         return {"actions": actions, "action_ids": predicted_action_token_ids}
