@@ -420,7 +420,14 @@ class SpatialVLAProcessor(ProcessorMixin):
                 if arr.shape[0] >= decoded_dim:
                     return arr[:decoded_dim]
                 else:
-                    pad = default[: decoded_dim - arr.shape[0]]
+                    needed = decoded_dim - arr.shape[0]
+                    # If default is shorter than needed, repeat it
+                    if default.shape[0] < needed:
+                        repeats = int(np.ceil(needed / default.shape[0]))
+                        extended_default = np.tile(default, repeats)
+                        pad = extended_default[:needed]
+                    else:
+                        pad = default[:needed]
                     return np.concatenate([arr, pad])
             action_low = _fit(action_low, default_low)
             action_high = _fit(action_high, default_high)

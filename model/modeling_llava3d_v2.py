@@ -88,6 +88,7 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
         num_logits_to_keep: int = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        kwargs.pop('pixel_values', None)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

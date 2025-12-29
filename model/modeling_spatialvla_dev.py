@@ -660,8 +660,8 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             else:
                 model_inputs = _move_field("_", model_inputs)
             
-            # Run VLM backbone
-            outputs = self.language_model(**model_inputs, output_hidden_states=True)
+            # Run VLM backbone (use self to handle multimodal fusion)                                                      │
+            outputs = self(**model_inputs, output_hidden_states=True)       
             last_hidden_state = outputs.hidden_states[-1]
             # Sample Actions
             actions = self.action_expert.sample_actions(last_hidden_state)
